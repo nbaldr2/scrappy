@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Scraper Master — Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app-container">
+  <header class="header fade-in">
+    <div class="header-brand">
+      <div class="logo">⚡</div>
+      <div>
+        <h1>Scraper Master</h1>
+        <div class="subtitle">Distributed Email Extraction Engine v2</div>
+      </div>
+    </div>
+    <div class="header-status"><span class="status-dot"></span><span id="headerStatus">System Online</span></div>
+  </header>
+
+  <div class="stats-grid fade-in">
+    <div class="stat-card"><div class="icon">🖥️</div><div class="value" id="statSlaves">0</div><div class="label">Active Slaves</div></div>
+    <div class="stat-card"><div class="icon">📋</div><div class="value" id="statJobs">0</div><div class="label">Total Jobs</div></div>
+    <div class="stat-card"><div class="icon">🌐</div><div class="value" id="statDomains">0</div><div class="label">Domains Processed</div></div>
+    <div class="stat-card"><div class="icon">📧</div><div class="value" id="statEmails">0</div><div class="label">Emails Found</div></div>
+  </div>
+
+  <!-- Slaves Section -->
+  <section class="section fade-in">
+    <div class="section-header">
+      <h2><span class="icon">🖥️</span> Slave Workers</h2>
+      <button class="btn btn-primary btn-sm" onclick="openProvisionModal()">+ Add Slave VPS</button>
+    </div>
+    <div id="slavesEmpty" class="empty-state">
+      <div class="icon">🔌</div><div class="title">No slaves registered</div>
+      <div class="desc">Click "Add Slave VPS" — enter IP, user, password and the master will auto-install everything</div>
+    </div>
+    <div class="table-wrapper" id="slavesTable" style="display:none">
+      <table>
+        <thead><tr><th>Name</th><th>IP / URL</th><th>Status</th><th>CPU</th><th>RAM</th><th>Disk</th><th>Assigned</th><th>Done</th><th>Emails</th><th>Last Seen</th><th>Actions</th></tr></thead>
+        <tbody id="slavesBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Upload Section -->
+  <section class="section fade-in">
+    <div class="section-header"><h2><span class="icon">📤</span> Upload Domains</h2></div>
+    <div class="upload-zone" id="uploadZone">
+      <input type="file" id="fileInput" accept=".txt,.csv" onchange="handleUpload(this)">
+      <div class="upload-icon">📁</div>
+      <div class="upload-text">Drop your domain list here or click to browse</div>
+      <div class="upload-hint">.txt file — one domain per line</div>
+    </div>
+    <div id="uploadResult" style="display:none;margin-top:16px"></div>
+  </section>
+
+  <!-- Jobs Section -->
+  <section class="section fade-in">
+    <div class="section-header">
+      <h2><span class="icon">📋</span> Scraping Jobs</h2>
+      <button class="btn btn-ghost btn-sm" onclick="refreshJobs()">↻ Refresh</button>
+    </div>
+    <div id="jobsEmpty" class="empty-state"><div class="icon">📭</div><div class="title">No jobs yet</div><div class="desc">Upload a domain list to create your first scraping job</div></div>
+    <div id="jobsList"></div>
+  </section>
+
+  <!-- Activity Log -->
+  <section class="section fade-in">
+    <div class="section-header"><h2><span class="icon">📜</span> Activity Log</h2><button class="btn btn-ghost btn-sm" onclick="clearLogs()">Clear</button></div>
+    <div class="log-terminal" id="logTerminal">
+      <div class="log-entry"><span class="log-time">[system]</span> <span class="log-info">Dashboard ready</span></div>
+    </div>
+  </section>
+</div>
+
+<!-- Provision Slave Modal -->
+<div class="modal-overlay" id="provisionModal">
+  <div class="modal">
+    <h3>🖥️ Auto-Install Slave VPS</h3>
+    <p style="font-size:0.82rem;color:var(--text-muted);margin-bottom:16px">Enter VPS credentials — the master will SSH in, upload scraper code, install dependencies, and start the service automatically.</p>
+    <div class="form-group"><label>Slave Name</label><input type="text" class="form-input" id="provName" placeholder="e.g. VPS-Paris-01"></div>
+    <div class="form-row">
+      <div class="form-group"><label>IP Address</label><input type="text" class="form-input" id="provIP" placeholder="1.2.3.4"></div>
+      <div class="form-group"><label>SSH Port</label><input type="number" class="form-input" id="provSSHPort" value="22"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Username</label><input type="text" class="form-input" id="provUser" value="root"></div>
+      <div class="form-group"><label>Password</label><input type="password" class="form-input" id="provPass" placeholder="••••••••"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Slave Port</label><input type="number" class="form-input" id="provSlavePort" value="8001"></div>
+      <div class="form-group"><label>Master URL (for slave callback)</label><input type="text" class="form-input" id="provMasterURL" placeholder="http://MASTER_IP:8000"></div>
+    </div>
+    <div id="provisionLog" class="log-terminal" style="display:none;max-height:180px;margin-top:12px"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeProvisionModal()">Cancel</button>
+      <button class="btn btn-primary" id="provisionBtn" onclick="provisionSlave()">🚀 Install & Start</button>
+    </div>
+  </div>
+</div>
+
+<!-- Job Config Modal -->
+<div class="modal-overlay" id="jobConfigModal">
+  <div class="modal">
+    <h3>⚙️ Launch Scraping Job</h3>
+    <input type="hidden" id="jobIdToStart">
+    <div class="form-row">
+      <div class="form-group"><label>Workers per Slave</label><input type="number" class="form-input" id="cfgWorkers" value="12" min="1" max="30"></div>
+      <div class="form-group"><label>Speed Mode</label><select class="form-input" id="cfgTurbo"><option value="true" selected>⚡ Turbo</option><option value="false">🐢 Standard</option></select></div>
+    </div>
+    <div class="form-group"><label>DNS Pre-Filter</label><select class="form-input" id="cfgDns"><option value="true" selected>Yes — skip dead domains</option><option value="false">No — scrape all</option></select></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeJobConfig()">Cancel</button>
+      <button class="btn btn-success" onclick="launchJob()">🚀 Launch</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
+<script>
+function toast(msg,type='info'){const c=document.getElementById('toasts'),t=document.createElement('div');t.className=`toast toast-${type}`;t.innerHTML=`${{success:'✅',error:'❌',info:'ℹ️'}[type]||'ℹ️'} ${msg}`;c.appendChild(t);setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),300)},4000)}
+function addLog(msg,cls='log-info'){const t=document.getElementById('logTerminal'),e=document.createElement('div');e.className='log-entry';e.innerHTML=`<span class="log-time">[${new Date().toLocaleTimeString()}]</span> <span class="${cls}">${msg}</span>`;t.appendChild(e);t.scrollTop=t.scrollHeight}
+function clearLogs(){document.getElementById('logTerminal').innerHTML=''}
+function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+function formatTime(iso){if(!iso)return'—';try{return new Date(iso).toLocaleTimeString()}catch{return iso}}
+function timeSince(iso){if(!iso)return'—';try{const s=Math.floor((Date.now()-new Date(iso).getTime())/1000);if(s<10)return'just now';if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago'}catch{return'—'}}
+
+// ── Provision Modal ──
+function openProvisionModal(){document.getElementById('provisionModal').classList.add('active');document.getElementById('provisionLog').style.display='none'}
+function closeProvisionModal(){document.getElementById('provisionModal').classList.remove('active')}
+
+let _provPolling=null;
+async function provisionSlave(){
+  const ip=document.getElementById('provIP').value.trim();
+  const user=document.getElementById('provUser').value.trim()||'root';
+  const password=document.getElementById('provPass').value;
+  const sshPort=document.getElementById('provSSHPort').value||'22';
+  const slavePort=document.getElementById('provSlavePort').value||'8001';
+  const name=document.getElementById('provName').value.trim()||`Slave-${ip.split('.').pop()}`;
+  const masterUrl=document.getElementById('provMasterURL').value.trim();
+  if(!ip||!password){toast('IP and password are required','error');return}
+  document.getElementById('provisionBtn').disabled=true;
+  document.getElementById('provisionBtn').innerHTML='<span class="spinner"></span> Installing...';
+  const logEl=document.getElementById('provisionLog');logEl.style.display='block';logEl.innerHTML='<div class="log-entry"><span class="log-info">Starting provisioning...</span></div>';
+  try{
+    const r=await fetch('/api/slaves/provision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,user,password,ssh_port:parseInt(sshPort),slave_port:parseInt(slavePort),name,master_url:masterUrl})});
+    const data=await r.json();
+    if(data.ok){
+      toast(`Provisioning started: ${data.slave_id}`,'success');
+      addLog(`Provisioning ${name} (${ip})...`,'log-info');
+      // Poll provision logs
+      _provPolling=setInterval(async()=>{
+        try{
+          const lr=await fetch(`/api/slaves/${data.slave_id}/logs`);
+          const ld=await lr.json();
+          logEl.innerHTML=ld.logs.map(l=>`<div class="log-entry">${esc(l)}</div>`).join('');
+          logEl.scrollTop=logEl.scrollHeight;
+          // Check if done
+          const sr=await fetch('/api/slaves');
+          const ss=await sr.json();
+          const sv=ss.find(s=>s.id===data.slave_id);
+          if(sv&&sv.status!=='provisioning'){
+            clearInterval(_provPolling);_provPolling=null;
+            document.getElementById('provisionBtn').disabled=false;
+            document.getElementById('provisionBtn').innerHTML='🚀 Install & Start';
+            if(sv.status==='idle'){toast(`${name} is ready!`,'success');addLog(`${name} provisioned successfully`,'log-success')}
+            else{toast(`${name}: ${sv.status}`,'error');addLog(`${name} provisioning ended: ${sv.status}`,'log-error')}
+            refreshSlaves();
+          }
+        }catch{}
+      },2000);
+    }else{toast(data.detail||'Failed','error');document.getElementById('provisionBtn').disabled=false;document.getElementById('provisionBtn').innerHTML='🚀 Install & Start'}
+  }catch(e){toast('Provision request failed','error');document.getElementById('provisionBtn').disabled=false;document.getElementById('provisionBtn').innerHTML='🚀 Install & Start'}
+}
+
+// ── Slaves ──
+async function removeSlave(id){if(!confirm('Remove this slave?'))return;await fetch(`/api/slaves/${id}`,{method:'DELETE'});toast('Slave removed','info');refreshSlaves()}
+async function refreshSlaves(){
+  try{
+    const r=await fetch('/api/slaves');const slaves=await r.json();
+    document.getElementById('statSlaves').textContent=slaves.filter(s=>!['dead','offline','error'].includes(s.status)).length;
+    if(!slaves.length){document.getElementById('slavesEmpty').style.display='';document.getElementById('slavesTable').style.display='none';return}
+    document.getElementById('slavesEmpty').style.display='none';document.getElementById('slavesTable').style.display='';
+    document.getElementById('slavesBody').innerHTML=slaves.map(s=>{
+      const ss=s.system_stats||{};
+      const cpu=ss.cpu_load_1m!==undefined?ss.cpu_load_1m.toFixed(1):'—';
+      const ram=ss.ram_percent!==undefined?`${ss.ram_percent}%`:'—';
+      const disk=ss.disk_percent!==undefined?`${ss.disk_percent}%`:'—';
+      const statusCls=s.status==='provisioning'?'processing':s.status;
+      const provBadge=s.status==='provisioning'?` <span class="spinner" style="margin-left:4px"></span>`:'';
+      return`<tr>
+        <td><strong>${esc(s.name)}</strong></td>
+        <td><code style="font-size:0.75rem;color:var(--text-muted)">${esc(s.ip||'')} · :${esc(s.url.split(':').pop())}</code></td>
+        <td><span class="badge badge-${statusCls}">${s.status}</span>${provBadge}</td>
+        <td style="font-family:var(--font-mono);font-size:0.82rem">${cpu}</td>
+        <td style="font-family:var(--font-mono);font-size:0.82rem">${ram}</td>
+        <td style="font-family:var(--font-mono);font-size:0.82rem">${disk}</td>
+        <td>${s.domains_assigned}</td><td>${s.domains_done}</td>
+        <td style="color:var(--success);font-weight:600">${s.emails_found}</td>
+        <td style="font-size:0.75rem;color:var(--text-muted)">${timeSince(s.last_seen)}</td>
+        <td><button class="btn btn-danger btn-sm" onclick="removeSlave('${s.id}')">✕</button></td>
+      </tr>`}).join('');
+  }catch{}
+}
+
+// ── Upload ──
+const uz=document.getElementById('uploadZone');
+uz.addEventListener('dragover',e=>{e.preventDefault();uz.classList.add('dragover')});
+uz.addEventListener('dragleave',()=>uz.classList.remove('dragover'));
+uz.addEventListener('drop',e=>{e.preventDefault();uz.classList.remove('dragover');if(e.dataTransfer.files.length)handleUploadFile(e.dataTransfer.files[0])});
+function handleUpload(input){if(input.files.length)handleUploadFile(input.files[0])}
+async function handleUploadFile(file){
+  const fd=new FormData();fd.append('file',file);
+  try{const r=await fetch('/api/jobs/upload',{method:'POST',body:fd});const d=await r.json();
+    if(d.ok){toast(`Uploaded: ${d.domains_raw} domains`,'success');addLog(`Job ${d.job_id} created — ${d.domains_raw} raw domains`,'log-success');
+      document.getElementById('uploadResult').style.display='block';
+      document.getElementById('uploadResult').innerHTML=`<div style="display:flex;align-items:center;gap:12px;padding:14px;background:var(--success-bg);border:1px solid rgba(16,185,129,0.2);border-radius:var(--radius-md)"><span style="font-size:1.4rem">✅</span><div><strong>${d.domains_raw.toLocaleString()} domains uploaded</strong><br><span style="font-size:0.82rem;color:var(--text-muted)">Job: ${d.job_id}</span></div><button class="btn btn-success btn-sm" style="margin-left:auto" onclick="openJobConfig('${d.job_id}')">🚀 Launch</button></div>`;
+      refreshJobs()}}catch(e){toast('Upload failed','error')}
+}
+
+// ── Job Config ──
+function openJobConfig(id){document.getElementById('jobIdToStart').value=id;document.getElementById('jobConfigModal').classList.add('active')}
+function closeJobConfig(){document.getElementById('jobConfigModal').classList.remove('active')}
+async function launchJob(){
+  const id=document.getElementById('jobIdToStart').value,w=parseInt(document.getElementById('cfgWorkers').value)||12,
+    t=document.getElementById('cfgTurbo').value==='true',d=document.getElementById('cfgDns').value==='true';
+  closeJobConfig();
+  try{const r=await fetch(`/api/jobs/${id}/start?workers=${w}&turbo=${t}&dns_on=${d}`,{method:'POST'});const data=await r.json();
+    if(data.ok){toast('Job launched!','success');addLog(`Job ${id} launched`,'log-success');refreshJobs()}
+    else{toast(data.detail||'Failed','error');addLog(`Launch failed: ${data.detail}`,'log-error')}}
+  catch(e){toast('Failed','error')}
+}
+
+// ── Jobs ──
+async function refreshJobs(){
+  try{const r=await fetch('/api/jobs');const jobs=await r.json();
+    document.getElementById('statJobs').textContent=jobs.length;
+    let td=0,te=0;jobs.forEach(j=>{td+=j.domains_live||j.domains_cleaned||0;te+=j.emails_count||0});
+    document.getElementById('statDomains').textContent=td.toLocaleString();document.getElementById('statEmails').textContent=te.toLocaleString();
+    if(!jobs.length){document.getElementById('jobsEmpty').style.display='';document.getElementById('jobsList').innerHTML='';return}
+    document.getElementById('jobsEmpty').style.display='none';
+    document.getElementById('jobsList').innerHTML=jobs.map(j=>{
+      const isActive=['cleaning','dns_filtering','scraping','processing'].includes(j.status),isDone=j.status==='completed';
+      return`<div style="padding:20px;background:var(--bg-glass);border:1px solid var(--border-glass);border-radius:var(--radius-md);margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <div><strong>${esc(j.id)}</strong> <span class="badge badge-${j.status}">${j.status}</span>${isActive?'<span class="spinner" style="margin-left:8px"></span>':''}</div>
+          <div style="display:flex;gap:8px">${j.status==='uploaded'?`<button class="btn btn-success btn-sm" onclick="openJobConfig('${j.id}')">🚀 Launch</button>`:''}${isDone&&j.emails_count?`<a href="/api/jobs/${j.id}/download" class="btn btn-primary btn-sm">📥 Download (${j.emails_count})</a>`:''}</div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;font-size:0.82rem;color:var(--text-secondary)">
+          <div>📥 Raw: <strong style="color:var(--text-primary)">${(j.domains_raw||0).toLocaleString()}</strong></div>
+          <div>🧹 Cleaned: <strong style="color:var(--text-primary)">${(j.domains_cleaned||0).toLocaleString()}</strong></div>
+          <div>✅ Live: <strong style="color:var(--success)">${(j.domains_live||0).toLocaleString()}</strong></div>
+          <div>📧 Emails: <strong style="color:var(--accent-primary)">${(j.emails_count||0).toLocaleString()}</strong></div>
+        </div>
+        ${j.error?`<div style="margin-top:10px;padding:8px 12px;background:var(--danger-bg);border-radius:var(--radius-sm);font-size:0.8rem;color:var(--danger)">⚠ ${esc(j.error)}</div>`:''}
+        ${j.clean_stats&&j.clean_stats.original?`<div style="margin-top:10px;font-size:0.78rem;color:var(--text-muted)">Cleaning: ${j.clean_stats.original}→${j.clean_stats.final} (${j.clean_stats.removed} removed)${j.dns_stats&&j.dns_stats.alive?` · DNS: ${j.dns_stats.alive} alive, ${j.dns_stats.dead} dead`:''}</div>`:''}</div>`}).join('')}catch{}
+}
+
+refreshSlaves();refreshJobs();setInterval(()=>{refreshSlaves();refreshJobs()},5000);
+</script>
+</body>
+</html>

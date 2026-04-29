@@ -121,7 +121,7 @@
 <div class="toast-container" id="toasts"></div>
 
 <script>
-function toast(msg,type='info'){const c=document.getElementById('toasts'),t=document.createElement('div');t.className=`toast toast-${type}`;t.innerHTML=`${{success:'✅',error:'❌',info:'ℹ️'}[type]||'ℹ️'} ${msg}`;c.appendChild(t);setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),300)},4000)}
+function toast(msg,type='info'){const c=document.getElementById('toasts'),t=document.createElement('div');t.className=`toast toast-${type}`;const icon={'success':'✅','error':'❌','info':'ℹ️'}[type]||'ℹ️';t.innerHTML=`${icon} ${msg}`;c.appendChild(t);setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),300)},4000)}
 function addLog(msg,cls='log-info'){const t=document.getElementById('logTerminal'),e=document.createElement('div');e.className='log-entry';e.innerHTML=`<span class="log-time">[${new Date().toLocaleTimeString()}]</span> <span class="${cls}">${msg}</span>`;t.appendChild(e);t.scrollTop=t.scrollHeight}
 function clearLogs(){document.getElementById('logTerminal').innerHTML=''}
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}

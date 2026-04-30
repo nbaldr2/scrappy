@@ -552,10 +552,20 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
                 raise RuntimeError("venv/bin/pip does not exist after all attempts")
             
             log("Installing Python packages (may take 30-90s)...")
-            _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q && "
-                        f"venv/bin/pip install --no-cache-dir -r requirements.txt -q",
-                  timeout=300)
-            log("✓ Python dependencies installed")
+            # Use check=True to catch pip install failures
+            try:
+                _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q", timeout=120, check=True)
+                _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --no-cache-dir -r requirements.txt -q", timeout=300, check=True)
+            except RuntimeError as pip_err:
+                log(f"✗ pip install failed: {str(pip_err)[:150]}")
+                raise
+            
+            # Verify packages actually work
+            verify = _exec(ssh, f"{REMOTE_DIR}/venv/bin/python -c 'import fastapi,uvicorn,httpx,requests,lxml,cssselect,colorama,pydantic' 2>&1 && echo 'VERIFIED'", timeout=15).strip()
+            if not verify.endswith('VERIFIED'):
+                log("✗ Package verification failed after installation")
+                raise RuntimeError("Packages installed but import test failed")
+            log("✓ Python dependencies installed and verified")
 
         # 5. Create systemd service
         log("Configuring systemd service...")

@@ -13,6 +13,7 @@ import socket
 import time
 import uuid
 import threading
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -960,7 +961,9 @@ async def upload_domains(file: UploadFile = File(...), name: str = Form(None)):
         content = (await file.read()).decode("utf-8", errors="ignore")
         lines = content.strip().splitlines()
         job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:6]
-        fpath = UPLOAD_DIR / f"{job_id}.txt"
+        job_dir = UPLOAD_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        fpath = job_dir / "domains.txt"
         fpath.write_text(content, encoding="utf-8")
         
         # Generate name from filename if not provided
@@ -1227,7 +1230,8 @@ async def _poll_until_done(job_id: str):
     
     # Save final emails to file
     emails = await db.get_emails(job_id)
-    result_file = RESULT_DIR / f"{job_id}_emails.txt"
+    (RESULT_DIR / job_id).mkdir(parents=True, exist_ok=True)
+    result_file = RESULT_DIR / job_id / "emails.txt"
     result_file.write_text("\n".join(sorted(emails)), encoding="utf-8")
 
 
@@ -1268,9 +1272,10 @@ async def collect_emails(job_id: str, data: dict):
 
 @app.get("/api/jobs/{job_id}/download")
 async def download_emails(job_id: str):
-    fpath = RESULT_DIR / f"{job_id}_emails.txt"
+    fpath = RESULT_DIR / job_id / "emails.txt"
     if not fpath.exists():
         # Generate file from database
+        (RESULT_DIR / job_id).mkdir(parents=True, exist_ok=True)
         emails = await db.get_emails(job_id)
         if emails:
             fpath.write_text("\n".join(sorted(emails)), encoding="utf-8")
@@ -1339,9 +1344,10 @@ async def delete_job_endpoint(job_id: str):
     deleted = await db.delete_job(job_id)
     if deleted:
         # Also delete result file if exists
-        result_file = RESULT_DIR / f"{job_id}_emails.txt"
-        if result_file.exists():
-            result_file.unlink()
+        # Delete job directory and all files
+        for d in [UPLOAD_DIR / job_id, RESULT_DIR / job_id]:
+            if d.exists():
+                shutil.rmtree(d)
         return {"ok": True, "message": "Job deleted"}
     raise HTTPException(404, "Job not found")
 

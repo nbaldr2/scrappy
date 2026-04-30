@@ -40,8 +40,8 @@ MASTER_URL = os.environ.get("MASTER_URL", "http://localhost:8000")
 CONNECT_TIMEOUT = 4
 READ_TIMEOUT = 6
 MAX_CONTENT_KB = 512
-MAX_PAGES = 10
-EARLY_EXIT = 4
+MAX_PAGES = 20
+EARLY_EXIT = 10
 DNS_TIMEOUT = 2
 EMAIL_BATCH_SIZE = 50  # Send emails to master every N new ones
 

@@ -625,20 +625,37 @@ HEARTBEAT_TIMEOUT  = 45   # mark dead after this many seconds without response
 _monitor_task = None
 
 
+def _parse_last_seen(last_seen) -> datetime:
+    """Parse last_seen value - handles both datetime objects and ISO strings."""
+    if last_seen is None:
+        return None
+    if isinstance(last_seen, datetime):
+        return last_seen
+    try:
+        return datetime.fromisoformat(str(last_seen).replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
 async def _heartbeat_monitor():
     """Background task: pings all registered slaves every HEARTBEAT_INTERVAL.
     Updates both in-memory cache AND database with system stats."""
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
         
-        # Reload slaves from database
+        # Add new slaves from database (don't overwrite existing in-memory data)
         try:
             db_slaves = await db.list_slaves()
             for s in db_slaves:
-                if s["id"] not in slaves:
-                    slaves[s["id"]] = s
-        except Exception:
-            pass
+                sid = s["id"]
+                if sid not in slaves:
+                    # New slave from DB - add to memory
+                    slaves[sid] = s
+                elif slaves[sid].get("status") == "provisioning":
+                    # Sync provisioning progress from thread
+                    slaves[sid]["provision_progress"] = s.get("provision_progress", "")
+        except Exception as e:
+            print(f"[HEARTBEAT] Failed to load slaves from DB: {e}")
         
         if not slaves:
             continue
@@ -658,9 +675,9 @@ async def _heartbeat_monitor():
                     now_dt = datetime.now()
                     system_stats = data.get("system_stats", {})
                     
-                    # Update in-memory
-                    s["last_seen"] = now_dt.isoformat()
-                    s["system_stats"] = system_stats
+                    # Update in-memory (keep datetime object, not string)
+                    slaves[sid]["last_seen"] = now_dt
+                    slaves[sid]["system_stats"] = system_stats
 
                     # Update database
                     update_data = {
@@ -669,29 +686,31 @@ async def _heartbeat_monitor():
                     }
                     
                     # If it was marked dead/error but responded, revive
-                    if s["status"] in ("dead", "offline", "error"):
-                        s["status"] = "idle"
+                    if s.get("status") in ("dead", "offline", "error"):
+                        slaves[sid]["status"] = "idle"
                         update_data["status"] = "idle"
                     
                     try:
                         await db.update_slave(sid, **update_data)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[HEARTBEAT] Failed to update slave {sid} in DB: {e}")
 
-                except Exception:
+                except Exception as e:
                     # Calculate time since last seen
-                    try:
-                        last = datetime.fromisoformat(s.get("last_seen", ""))
+                    last = _parse_last_seen(s.get("last_seen"))
+                    if last is None:
+                        elapsed = HEARTBEAT_TIMEOUT + 1  # Force offline if never seen
+                    else:
                         elapsed = (datetime.now() - last).total_seconds()
-                    except Exception:
-                        elapsed = 999
 
                     if elapsed > HEARTBEAT_TIMEOUT:
-                        s["status"] = "offline"
-                        try:
-                            await db.update_slave(sid, status="offline")
-                        except Exception:
-                            pass
+                        if s.get("status") != "offline":
+                            print(f"[HEARTBEAT] Slave {sid} marked offline (no response for {int(elapsed)}s)")
+                            slaves[sid]["status"] = "offline"
+                            try:
+                                await db.update_slave(sid, status="offline")
+                            except Exception:
+                                pass
 
 
 # ── Slave Management ───────────────────────────────────────────────────────────
@@ -904,9 +923,11 @@ async def slave_heartbeat(slave_id: str, data: dict):
     if not slave:
         raise HTTPException(404, "Unknown slave")
     
+    now_dt = datetime.now()
+    
     # Update slave status
     update_fields = {
-        "last_seen": datetime.now(),
+        "last_seen": now_dt,
         "status": data.get("status", slave.get("status", "idle")),
         "domains_done": data.get("domains_done", slave.get("domains_done", 0)),
         "emails_found": data.get("emails_found", slave.get("emails_found", 0)),
@@ -915,7 +936,14 @@ async def slave_heartbeat(slave_id: str, data: dict):
     if data.get("system_stats"):
         update_fields["system_stats"] = data.get("system_stats")
     
+    # Update database
     await db.update_slave(slave_id, **update_fields)
+    
+    # Update in-memory cache for immediate UI sync
+    if slave_id in slaves:
+        slaves[slave_id].update(update_fields)
+        slaves[slave_id]["last_seen"] = now_dt
+    
     return {"ok": True}
 
 

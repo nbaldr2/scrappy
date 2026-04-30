@@ -402,7 +402,7 @@ async function removeSlaveConfirm() {
 async function removeSlave(id){if(!confirm('Remove this slave?'))return;await fetch(`/api/slaves/${id}`,{method:'DELETE'});toast('Slave removed','info');refreshSlaves()}
 async function refreshSlaves(){
   try{
-    const r=await fetch('/api/slaves');const slaves=await r.json();
+    const r=await fetch('/api/slaves');const slaves=await r.json();slaves.sort((a,b)=>(a.id||'').localeCompare(b.id||''));
     document.getElementById('statSlaves').textContent=slaves.filter(s=>!['dead','offline','error'].includes(s.status)).length;
     if(!slaves.length){document.getElementById('slavesEmpty').style.display='';document.getElementById('slavesTable').style.display='none';return}
     document.getElementById('slavesEmpty').style.display='none';document.getElementById('slavesTable').style.display='';

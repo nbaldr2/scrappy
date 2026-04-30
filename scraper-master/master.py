@@ -186,10 +186,10 @@ def clean_domains(raw_lines: list[str], phase2: bool = True) -> tuple[list[str],
     return cleaned, stats
 
 
-# ── DNS Pre-Filter (High-Performance Async) ────────────────────────────────────
+# ── DNS Pre-Filter (Ultra High-Performance) ─────────────────────────────────────
 
-DNS_TIMEOUT = 2
-DNS_MAX_WORKERS = 500  # Increased from 150 for much faster processing
+DNS_TIMEOUT = 1.0  # Reduced from 2s for faster timeout
+DNS_MAX_WORKERS = 2000  # Increased from 500 for ultra-fast processing
 
 # Global cancellation flags for jobs
 job_cancel_flags: dict[str, bool] = {}
@@ -198,18 +198,19 @@ async def _dns_check_async(host: str, resolver=None) -> bool:
     """Async DNS check using aiodns if available, otherwise fallback to socket."""
     if HAS_AIODNS and resolver:
         try:
-            # Use query_dns() for aiodns >= 4.0.0 (query() is deprecated)
+            # Use query_dns() for aiodns >= 4.0.0 with very short timeout
             result = await asyncio.wait_for(resolver.query_dns(host, 'A'), timeout=DNS_TIMEOUT)
-            return bool(result)  # Returns list of results if successful
+            return bool(result)
+        except asyncio.TimeoutError:
+            return False
         except Exception:
-            # aiodns failed, fall back to sync socket method
-            pass
+            return False
     # Fallback to sync socket in thread (always available)
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _dns_check_sync, host)
 
 def _dns_check_sync(host: str) -> bool:
-    """Synchronous DNS check using socket."""
+    """Synchronous DNS check using socket with minimal timeout."""
     orig = socket.getdefaulttimeout()
     try:
         socket.setdefaulttimeout(DNS_TIMEOUT)
@@ -222,52 +223,78 @@ def _dns_check_sync(host: str) -> bool:
 
 async def dns_filter_async(domains: list[str], job_id: str = None) -> tuple[list[str], int]:
     """
-    High-performance async DNS filter with progress tracking and cancellation support.
-    Uses aiodns for much faster resolution when available.
+    Ultra high-performance async DNS filter with progress tracking.
+    Uses 2000 concurrent workers and 1s timeout for maximum speed.
     """
     global job_cancel_flags
     
-    live, dead = [], 0
+    if not domains:
+        return [], 0
+    
+    live = []
+    dead = 0
     total = len(domains)
     checked = 0
+    live_count = 0
     
     # Check if job was cancelled
     if job_id and job_cancel_flags.get(job_id, False):
         return [], 0
     
-    # Create aiodns resolver if available (much faster)
-    resolver = None
+    # Create multiple aiodns resolvers for parallel processing (much faster)
+    resolvers = []
     if HAS_AIODNS:
         try:
-            resolver = aiodns.DNSResolver()
+            # Create multiple resolvers for better throughput
+            for _ in range(10):
+                resolvers.append(aiodns.DNSResolver(timeout=DNS_TIMEOUT))
         except Exception:
-            resolver = None
+            resolvers = []
     
-    # Process in batches with progress updates
-    batch_size = 100  # Update progress every 100 domains
+    # Process with ultra-high concurrency
     semaphore = asyncio.Semaphore(DNS_MAX_WORKERS)
+    lock = asyncio.Lock()
     
-    async def check_one(domain: str) -> tuple[bool, str]:
-        nonlocal checked
+    async def check_one(domain: str, resolver_idx: int) -> tuple[bool, str]:
+        nonlocal checked, live_count
         async with semaphore:
             # Check for cancellation
             if job_id and job_cancel_flags.get(job_id, False):
                 return False, domain
+            
+            resolver = resolvers[resolver_idx % len(resolvers)] if resolvers else None
             result = await _dns_check_async(domain, resolver)
-            checked += 1
-            # Update job progress periodically
-            if job_id and checked % batch_size == 0 and job_id in jobs:
-                jobs[job_id]["dns_progress"] = {"checked": checked, "total": total, "live": len(live)}
+            
+            async with lock:
+                checked += 1
+                if result:
+                    live_count += 1
+            
             return result, domain
     
-    # Run all checks concurrently with semaphore limiting
-    tasks = [check_one(d) for d in domains]
+    # Create all tasks at once for maximum parallelism
+    tasks = [check_one(d, i) for i, d in enumerate(domains)]
+    
+    # Run with progress updates
+    progress_update_interval = 500  # Update every 500 domains
+    
+    async def update_progress():
+        while checked < total:
+            await asyncio.sleep(0.5)
+            if job_id and job_id in jobs:
+                jobs[job_id]["dns_progress"] = {"checked": checked, "total": total, "live": live_count}
+    
+    # Start progress updater
+    progress_task = asyncio.create_task(update_progress()) if job_id else None
     
     try:
+        # Run all DNS checks in parallel
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        
         for result in results:
             if job_id and job_cancel_flags.get(job_id, False):
-                # Job cancelled
+                if progress_task:
+                    progress_task.cancel()
                 return live, dead
             if isinstance(result, Exception):
                 dead += 1
@@ -279,8 +306,11 @@ async def dns_filter_async(domains: list[str], job_id: str = None) -> tuple[list
                     dead += 1
             else:
                 dead += 1
-    except Exception as e:
+    except Exception:
         pass
+    finally:
+        if progress_task:
+            progress_task.cancel()
     
     return live, dead
 

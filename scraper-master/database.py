@@ -323,8 +323,9 @@ async def list_jobs(
     values["offset"] = offset
     
     query = f"""
-        SELECT id, name, status, domains_total, domains_live, domains_done,
-               emails_count, progress, error, created_at, started_at, finished_at
+        SELECT id, name, status, domains_total, domains_cleaned, domains_live,
+               domains_done, emails_count, progress, error, created_at,
+               started_at, finished_at
         FROM jobs
         {where_sql}
         ORDER BY created_at DESC

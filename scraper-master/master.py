@@ -647,16 +647,16 @@ async def _heartbeat_monitor():
                 try:
                     r = await client.get(f"{slave_url}/api/health")
                     data = r.json()
-                    now_iso = datetime.now().isoformat()
+                    now_dt = datetime.now()
                     system_stats = data.get("system_stats", {})
                     
                     # Update in-memory
-                    s["last_seen"] = now_iso
+                    s["last_seen"] = now_dt.isoformat()
                     s["system_stats"] = system_stats
 
                     # Update database
                     update_data = {
-                        "last_seen": now_iso,
+                        "last_seen": now_dt,
                         "system_stats": system_stats
                     }
                     
@@ -704,7 +704,7 @@ async def register_slave(data: dict):
 
 
 @app.post("/api/slaves/provision")
-async def provision_slave(data: dict):
+async def provision_slave(data: dict, request: Request):
     """Auto-provision a slave VPS: SSH in, upload code, install, start."""
     ip = data.get("ip", "").strip()
     user = data.get("user", "root").strip()
@@ -719,8 +719,8 @@ async def provision_slave(data: dict):
     sid = str(uuid.uuid4())[:8]
     master_url = data.get("master_url", "").strip()
     if not master_url:
-        # Auto-detect: assume master is accessible from slave at this IP
-        master_url = f"http://{data.get('master_ip', ip)}:8000"
+        # Auto-detect master URL from request host
+        master_url = str(request.base_url).rstrip("/")
 
     # Register slave immediately in memory and database (status=provisioning)
     slave_url = f"http://{ip}:{slave_port}"
@@ -898,7 +898,7 @@ async def slave_heartbeat(slave_id: str, data: dict):
     
     # Update slave status
     update_fields = {
-        "last_seen": datetime.now().isoformat(),
+        "last_seen": datetime.now(),
         "status": data.get("status", slave.get("status", "idle")),
         "domains_done": data.get("domains_done", slave.get("domains_done", 0)),
         "emails_found": data.get("emails_found", slave.get("emails_found", 0)),
@@ -935,7 +935,7 @@ async def upload_domains(file: UploadFile = File(...), name: str = Form(None)):
 
 
 @app.post("/api/jobs/{job_id}/start")
-async def start_job(job_id: str, workers: int = 12, turbo: bool = True,
+async def start_job(request: Request, job_id: str, workers: int = 12, turbo: bool = True,
                     dns_on: bool = True):
     """Clean, DNS filter, split and dispatch to slaves."""
     job = await db.get_job(job_id)
@@ -955,11 +955,13 @@ async def start_job(job_id: str, workers: int = 12, turbo: bool = True,
 
     await db.update_job(job_id, status="processing", started_at=datetime.now(), error=None)
 
-    asyncio.create_task(_run_job(job_id, workers, turbo, dns_on))
+    master_url = str(request.base_url).rstrip("/")
+
+    asyncio.create_task(_run_job(job_id, workers, turbo, dns_on, master_url))
     return {"ok": True, "status": "processing"}
 
 
-async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool):
+async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool, master_url: str):
     job = await db.get_job(job_id)
     if not job:
         print(f"[ERROR] Job {job_id} not found in database")
@@ -1039,7 +1041,7 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool):
                 tasks.append(
                     client.post(f"{url}/api/scrape", json={
                         "job_id": job_id,
-                        "master_url": "",
+                        "master_url": master_url,
                         "domains": chunk,
                         "workers": workers,
                         "turbo": turbo,
@@ -1113,11 +1115,12 @@ async def _poll_until_done(job_id: str):
                     data = r.json()
                     
                     # Update slave status in database
-                    await db.update_slave(sid, 
+                    await db.update_slave(
+                        sid,
                         status=data.get("status", "unknown"),
                         domains_done=data.get("domains_done", 0),
                         emails_found=data.get("emails_found", 0),
-                        last_seen=datetime.now().isoformat()
+                        last_seen=datetime.now(),
                     )
                     
                     # Update assignment
@@ -1268,10 +1271,11 @@ async def cancel_job(job_id: str):
     
     # Set cancellation flag
     job_cancel_flags[job_id] = True
-    await db.update_job(job_id, 
+    await db.update_job(
+        job_id,
         status="cancelled",
         finished_at=datetime.now(),
-        error="Job cancelled by user"
+        error="Job cancelled by user",
     )
     
     # Log the cancellation

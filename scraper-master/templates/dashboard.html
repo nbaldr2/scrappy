@@ -489,7 +489,7 @@ async function refreshJobs(){
         </div>
         <div style="font-size:0.78rem;color:var(--text-muted);margin-bottom:8px">ID: ${j.id} • Created: ${j.created_at?new Date(j.created_at).toLocaleString():'—'}</div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;font-size:0.82rem;color:var(--text-secondary)">
-          <div>📥 Raw: <strong style="color:var(--text-primary)">${(j.domains_raw||0).toLocaleString()}</strong></div>
+          <div>📥 Raw: <strong style="color:var(--text-primary)">${(j.domains_total||0).toLocaleString()}</strong></div>
           <div>🧹 Cleaned: <strong style="color:var(--text-primary)">${(j.domains_cleaned||0).toLocaleString()}</strong></div>
           <div>✅ Live: <strong style="color:var(--success)">${(j.domains_live||0).toLocaleString()}</strong></div>
           <div>📧 Emails: <strong style="color:var(--accent-primary)">${(j.emails_count||0).toLocaleString()}</strong></div>

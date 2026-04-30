@@ -66,6 +66,11 @@ async def lifespan(app: FastAPI):
     # Store main event loop reference for thread-safe DB access
     global _main_loop
     _main_loop = asyncio.get_running_loop()
+    # Load slaves from database into memory on startup
+    db_slaves = await db.list_slaves()
+    for s in db_slaves:
+        slaves[s["id"]] = s
+    print(f"Loaded {len(db_slaves)} slaves from database")
     # Start heartbeat monitor
     _monitor_task = asyncio.create_task(_heartbeat_monitor())
     print("Heartbeat monitor started")

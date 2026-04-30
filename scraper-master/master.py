@@ -55,6 +55,44 @@ jobs: dict[str, dict] = {}
 # Provisioning logs:  {slave_id: [log_lines]}
 provision_logs: dict[str, list] = {}
 
+# ── Persistence ───────────────────────────────────────────────────────────────
+
+STATE_FILE = BASE_DIR / "state.json"
+
+def save_state():
+    """Persist jobs and slaves to JSON file."""
+    try:
+        state = {
+            "jobs": {k: v for k, v in jobs.items()},
+            "slaves": {k: v for k, v in slaves.items()},
+        }
+        STATE_FILE.write_text(json.dumps(state, default=str), encoding="utf-8")
+    except Exception as e:
+        print(f"Warning: Failed to save state: {e}")
+
+def load_state():
+    """Load jobs and slaves from JSON file on startup."""
+    global jobs, slaves
+    try:
+        if STATE_FILE.exists():
+            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            # Load slaves
+            for sid, s in state.get("slaves", {}).items():
+                slaves[sid] = s
+                # Reset status for slaves that were active before restart
+                if s.get("status") in ("scraping", "processing"):
+                    slaves[sid]["status"] = "idle"
+            # Load jobs
+            for jid, j in state.get("jobs", {}).items():
+                jobs[jid] = j
+                # Reset status for jobs that were active before restart
+                if j.get("status") in ("cleaning", "dns_filtering", "scraping", "processing"):
+                    jobs[jid]["status"] = "failed"
+                    jobs[jid]["error"] = "Job interrupted by server restart"
+            print(f"Loaded {len(slaves)} slaves and {len(jobs)} jobs from state file")
+    except Exception as e:
+        print(f"Warning: Failed to load state: {e}")
+
 # ── Domain Cleaning (ported from pyscrap.py) ───────────────────────────────────
 
 CCTLD_SECOND_LEVEL = {
@@ -449,6 +487,8 @@ async def _heartbeat_monitor():
 @app.on_event("startup")
 async def start_monitor():
     global _monitor_task
+    # Load persisted state on startup
+    load_state()
     _monitor_task = asyncio.create_task(_heartbeat_monitor())
 
 
@@ -471,6 +511,7 @@ async def register_slave(data: dict):
         "system_stats": {},
         "provision_progress": "manual",
     }
+    save_state()
     return {"ok": True, "slave_id": sid}
 
 
@@ -530,6 +571,7 @@ async def remove_slave(slave_id: str):
     if slave_id in slaves:
         del slaves[slave_id]
         provision_logs.pop(slave_id, None)
+        save_state()
         return {"ok": True}
     raise HTTPException(404, "Slave not found")
 
@@ -588,6 +630,7 @@ async def upload_domains(file: UploadFile = File(...), name: str = Form(None)):
         "dns_progress": None,
         "error": None,
     }
+    save_state()
     return {"ok": True, "job_id": job_id, "name": name, "domains_raw": jobs[job_id]["domains_raw"]}
 
 

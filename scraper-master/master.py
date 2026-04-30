@@ -497,14 +497,21 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
                 log(f"  ⚠ {fname} not found locally")
         sftp.close()
 
-        # 3. Check if python3 already installed — skip apt if present
+        # 3. Check if python3 + venv already installed — skip apt if present
         slaves[sid]["provision_progress"] = "installing_system"
         has_python = _exec(ssh, "which python3 2>/dev/null && python3 --version", timeout=10).strip()
         if has_python and "Python 3" in has_python:
             log(f"✓ Python3 already installed: {has_python.split()[-1]}")
+            # Still ensure python3-venv is available (often missing on minimal VPS)
+            py_ver = _exec(ssh, "python3 -c 'import sys; print(f\"python3.{sys.version_info.minor}-venv\")'", timeout=10).strip()
+            has_venv = _exec(ssh, f"dpkg -l {py_ver} 2>/dev/null | grep -q ^ii && echo YES || echo NO", timeout=10).strip()
+            if has_venv != "YES":
+                log(f"Installing {py_ver} (may take 30-60s)...")
+                _exec(ssh, f"apt-get update -qq && apt-get install -y {py_ver} --no-install-recommends -qq", timeout=300)
+                log(f"✓ {py_ver} installed")
         else:
-            log("Installing python3 (may take 60-120s on fresh VPS)...")
-            _exec(ssh, "apt-get update -qq && apt-get install -y python3 python3-venv --no-install-recommends -qq",
+            log("Installing python3 + venv (may take 60-120s on fresh VPS)...")
+            _exec(ssh, "apt-get update -qq && apt-get install -y python3 python3-venv python3.12-venv --no-install-recommends -qq",
                   timeout=300)
             log("✓ Python3 installed")
 
@@ -515,7 +522,14 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
         if venv_ok.endswith("OK"):
             log("✓ Python venv and packages already installed — skipping")
         else:
-            _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv", timeout=60)
+            _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv --clear", timeout=60)
+            # Verify venv was created successfully
+            venv_check = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/pip && echo OK || echo FAIL", timeout=10).strip()
+            if venv_check != "OK":
+                log("⚠ venv creation failed, trying with --without-pip...")
+                _exec(ssh, f"rm -rf {REMOTE_DIR}/venv && cd {REMOTE_DIR} && python3 -m venv venv --without-pip", timeout=60)
+                # Install pip via get-pip.py
+                _exec(ssh, f"cd {REMOTE_DIR} && curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py && {REMOTE_DIR}/venv/bin/python get-pip.py && rm get-pip.py", timeout=120)
             log("Installing Python packages (may take 30-90s)...")
             _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q && "
                         f"venv/bin/pip install --no-cache-dir -r requirements.txt -q",

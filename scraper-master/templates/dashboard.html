@@ -465,6 +465,9 @@ async function cancelJob(id){if(!confirm('Cancel this job?'))return;try{const r=
 // ── Delete Job ──
 async function deleteJob(id){if(!confirm('Delete this job permanently? This cannot be undone.'))return;try{const r=await fetch(`/api/jobs/${id}`,{method:'DELETE'});const d=await r.json();if(d.ok){toast('Job deleted','info');addLog(`Job ${id} deleted`,'log-info');refreshJobs()}}catch(e){toast('Delete failed','error')}}
 
+// ── Retry Incomplete Job ──
+async function retryJob(id){if(!confirm('Retry incomplete domains? They will be reassigned to active slaves.'))return;try{const r=await fetch(`/api/jobs/${id}/retry`,{method:'POST'});const d=await r.json();if(d.ok){toast(`Retry started: ${d.domains_reassigned} domains → ${d.slaves_used} slaves`,'success');addLog(`Job ${id} retry: ${d.domains_reassigned} domains reassigned`,'log-success');refreshJobs()}else{toast(d.detail||'Retry failed','error')}}catch(e){toast('Retry failed','error')}}
+
 // ── Rename Job ──
 function openRenameModal(id,name){document.getElementById('renameJobId').value=id;document.getElementById('renameJobName').value=name||'';document.getElementById('renameModal').classList.add('active')}
 function closeRenameModal(){document.getElementById('renameModal').classList.remove('active')}
@@ -482,7 +485,7 @@ async function refreshJobs(){
     if(!jobs.length){document.getElementById('jobsEmpty').style.display='';document.getElementById('jobsList').innerHTML='';document.getElementById('jobsPagination').style.display='none';return}
     document.getElementById('jobsEmpty').style.display='none';
     document.getElementById('jobsList').innerHTML=jobs.map(j=>{
-      const isActive=['cleaning','dns_filtering','scraping','processing'].includes(j.status),isDone=j.status==='completed',isCancellable=isActive,isDeletable=['cancelled','failed','completed'].includes(j.status);
+      const isActive=['cleaning','dns_filtering','scraping','processing'].includes(j.status),isDone=j.status==='completed',isCancellable=isActive,isDeletable=['cancelled','failed','completed'].includes(j.status),isRetryable=['failed','completed'].includes(j.status)&&j.domains_done<j.domains_live;
       // DNS progress indicator
       let dnsProgress='';
       if(j.status==='dns_filtering'&&j.dns_progress){const p=j.dns_progress;dnsProgress=`<div style="margin-top:8px;font-size:0.78rem;color:var(--accent-primary)">🔍 DNS Check: ${p.checked.toLocaleString()}/${p.total.toLocaleString()} (${Math.round(p.checked/p.total*100)}%)</div>`}
@@ -513,6 +516,7 @@ async function refreshJobs(){
           <div style="display:flex;gap:8px">
             ${j.status==='uploaded'?`<button class="btn btn-success btn-sm" onclick="openJobConfig('${j.id}')">🚀 Launch</button>`:''}
             ${isCancellable?`<button class="btn btn-danger btn-sm" onclick="cancelJob('${j.id}')">✕ Cancel</button>`:''}
+            ${isRetryable?`<button class="btn btn-success btn-sm" onclick="retryJob('${j.id}')">🔄 Retry Incomplete</button>`:''}
             ${isDeletable?`<button class="btn btn-danger btn-sm" onclick="deleteJob('${j.id}')">🗑️ Delete</button>`:''}
             ${isDone&&j.emails_count?`<a href="/api/jobs/${j.id}/download" class="btn btn-primary btn-sm">📥 Download (${j.emails_count})</a>`:''}
             <button class="btn btn-ghost btn-sm" onclick="openRenameModal('${j.id}','${esc(j.name||'')}')" title="Rename">✏️</button>

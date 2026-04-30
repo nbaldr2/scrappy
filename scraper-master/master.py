@@ -1338,6 +1338,141 @@ async def cancel_job(job_id: str):
     return {"ok": True, "status": "cancelled"}
 
 
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_incomplete_job(request: Request, job_id: str, workers: int = 12, turbo: bool = True):
+    """Reassign unfinished domains from offline/failed slaves to active slaves."""
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    
+    if job["status"] not in ("failed", "completed", "scraping", "processing"):
+        raise HTTPException(400, f"Cannot retry job in '{job['status']}' status")
+
+    # Get assignments and find incomplete ones
+    assignments = await db.get_job_assignments(job_id)
+    incomplete = []
+    for a in assignments:
+        remaining = (a.get("domains_assigned", 0) or 0) - (a.get("domains_done", 0) or 0)
+        if remaining > 0:
+            incomplete.append({
+                "slave_id": a["slave_id"],
+                "slave_name": a.get("slave_name", ""),
+                "slave_url": a.get("slave_url", ""),
+                "remaining": remaining,
+            })
+    
+    if not incomplete:
+        raise HTTPException(400, "No incomplete domains found — all slaves finished their work")
+
+    total_remaining = sum(a["remaining"] for a in incomplete)
+    print(f"[RETRY] Job {job_id}: {total_remaining} domains remaining across {len(incomplete)} slaves")
+
+    # Load the original domain list
+    file_path = job.get("file_path")
+    if not file_path or not Path(file_path).exists():
+        raise HTTPException(400, "Original domain file not found — cannot determine which domains were unfinished")
+
+    # Re-read and clean domains (same pipeline as original _run_job)
+    raw_lines = Path(file_path).read_text(encoding="utf-8").splitlines()
+    cleaned, _ = clean_domains(raw_lines, phase2=True)
+    
+    # DNS filter if it was used originally
+    dns_stats = job.get("dns_stats") or {}
+    if dns_stats.get("alive") is not None:
+        live, _ = await dns_filter_async(cleaned, job_id)
+    else:
+        live = cleaned
+
+    # Figure out which domains each slave was assigned
+    # We need to reconstruct the chunks to find the unfinished ones
+    domains_per_slave = job.get("domains_per_slave") or {}
+    slave_ids_original = list(domains_per_slave.keys())
+    
+    # Rebuild the original chunks
+    chunk_size = len(live) // len(slave_ids_original) if slave_ids_original else 0
+    remainder = len(live) % len(slave_ids_original) if slave_ids_original else 0
+    
+    chunks_original = {}
+    idx = 0
+    for i, sid in enumerate(slave_ids_original):
+        size = chunk_size + (1 if i < remainder else 0)
+        chunks_original[sid] = live[idx:idx+size]
+        idx += size
+    
+    # Collect unfinished domains
+    unfinished_domains = []
+    for a in incomplete:
+        sid = a["slave_id"]
+        chunk = chunks_original.get(sid, [])
+        done = (a.get("domains_assigned", 0) or 0) - a["remaining"]
+        # Take the domains that weren't processed
+        unfinished_domains.extend(chunk[done:])
+    
+    if not unfinished_domains:
+        raise HTTPException(400, "Could not determine unfinished domains")
+
+    print(f"[RETRY] Job {job_id}: {len(unfinished_domains)} unfinished domains to reassign")
+
+    # Get currently active slaves
+    slaves_list = await db.list_slaves()
+    active = {s["id"]: s for s in slaves_list
+              if s.get("status") not in ("dead", "offline", "provisioning", "error")}
+    
+    if not active:
+        raise HTTPException(400, "No active slaves available — bring slaves online first")
+
+    # Split unfinished domains across active slaves
+    slave_ids = list(active.keys())
+    n = len(slave_ids)
+    chunk_size_new = len(unfinished_domains) // n
+    remainder_new = len(unfinished_domains) % n
+    
+    new_chunks = {}
+    new_domains_per_slave = {}
+    idx2 = 0
+    for i, sid in enumerate(slave_ids):
+        size = chunk_size_new + (1 if i < remainder_new else 0)
+        new_chunks[sid] = unfinished_domains[idx2:idx2+size]
+        idx2 += size
+        new_domains_per_slave[sid] = len(new_chunks[sid])
+        # Create new assignment
+        await db.assign_job_to_slave(job_id, sid, len(new_chunks[sid]))
+        # Update slave status
+        await db.update_slave(sid, status="scraping", domains_assigned=len(new_chunks[sid]),
+                              domains_done=0, emails_found=0)
+
+    # Update job status
+    await db.update_job(job_id, status="scraping", domains_per_slave=new_domains_per_slave, error=None)
+    await db.log_activity("info", "jobs", f"Job {job_id} retry: {len(unfinished_domains)} domains reassigned to {len(active)} slaves", {"job_id": job_id})
+
+    # Dispatch to slaves
+    master_url = str(request.base_url).rstrip("/")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        tasks = []
+        for sid, chunk in new_chunks.items():
+            url = active[sid]["url"]
+            tasks.append(
+                client.post(f"{url}/api/scrape", json={
+                    "job_id": job_id,
+                    "master_url": master_url,
+                    "domains": chunk,
+                    "workers": workers,
+                    "turbo": turbo,
+                })
+            )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, r in enumerate(results):
+            sid = slave_ids[i]
+            if isinstance(r, Exception):
+                await db.update_slave(sid, status="error")
+                await db.update_job(job_id, error=f"Slave {sid}: {str(r)[:100]}")
+
+    # Poll until done
+    asyncio.create_task(_poll_until_done(job_id))
+    
+    return {"ok": True, "status": "scraping", "domains_reassigned": len(unfinished_domains), "slaves_used": len(active)}
+
+
 @app.delete("/api/jobs/{job_id}")
 async def delete_job_endpoint(job_id: str):
     """Delete a job and all associated data."""

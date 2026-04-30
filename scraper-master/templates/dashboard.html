@@ -135,6 +135,50 @@
   </div>
 </div>
 
+<!-- Slave Settings Modal -->
+<div class="modal-overlay" id="slaveSettingsModal">
+  <div class="modal" style="max-width:600px">
+    <h3>🖥️ Slave Settings</h3>
+    <input type="hidden" id="slaveSettingsId">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+      <div class="form-group"><label>Name</label><input type="text" class="form-input" id="slaveSettingsName" placeholder="Slave name"></div>
+      <div class="form-group"><label>Status</label><input type="text" class="form-input" id="slaveSettingsStatus" readonly style="background:var(--bg-secondary)"></div>
+      <div class="form-group"><label>IP Address</label><input type="text" class="form-input" id="slaveSettingsIP" readonly style="background:var(--bg-secondary)"></div>
+      <div class="form-group"><label>Last Seen</label><input type="text" class="form-input" id="slaveSettingsLastSeen" readonly style="background:var(--bg-secondary)"></div>
+    </div>
+    
+    <h4 style="margin:16px 0 8px;font-size:0.95rem">📊 System Stats</h4>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px">
+      <div style="padding:12px;background:var(--bg-secondary);border-radius:var(--radius-sm);text-align:center">
+        <div style="font-size:1.5rem;font-weight:600" id="slaveStatsCPU">—</div>
+        <div style="font-size:0.75rem;color:var(--text-muted)">CPU Load</div>
+      </div>
+      <div style="padding:12px;background:var(--bg-secondary);border-radius:var(--radius-sm);text-align:center">
+        <div style="font-size:1.5rem;font-weight:600" id="slaveStatsRAM">—</div>
+        <div style="font-size:0.75rem;color:var(--text-muted)">RAM Used</div>
+      </div>
+      <div style="padding:12px;background:var(--bg-secondary);border-radius:var(--radius-sm);text-align:center">
+        <div style="font-size:1.5rem;font-weight:600" id="slaveStatsDisk">—</div>
+        <div style="font-size:0.75rem;color:var(--text-muted)">Disk Used</div>
+      </div>
+    </div>
+    
+    <h4 style="margin:16px 0 8px;font-size:0.95rem">⚡ Control Actions</h4>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">
+      <button class="btn btn-ghost btn-sm" id="slaveBtnRestartService" onclick="restartSlaveService()">🔄 Restart Service</button>
+      <button class="btn btn-ghost btn-sm" id="slaveBtnPause" onclick="pauseSlave()">⏸️ Pause</button>
+      <button class="btn btn-ghost btn-sm" id="slaveBtnResume" onclick="resumeSlave()" style="display:none">▶️ Resume</button>
+      <button class="btn btn-danger btn-sm" onclick="rebootSlave()">🔴 Reboot VPS</button>
+      <button class="btn btn-danger btn-sm" onclick="removeSlaveConfirm()">✕ Remove Slave</button>
+    </div>
+    
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeSlaveSettings()">Close</button>
+      <button class="btn btn-primary" onclick="saveSlaveSettings()">Save Changes</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-container" id="toasts"></div>
 
 <script>
@@ -198,6 +242,131 @@ async function provisionSlave(){
   }catch(e){toast('Provision request failed','error');document.getElementById('provisionBtn').disabled=false;document.getElementById('provisionBtn').innerHTML='🚀 Install & Start'}
 }
 
+// ── Slave Settings Modal ──
+let currentSlaveId = null;
+
+function openSlaveSettings(id) {
+  const r = fetch('/api/slaves').then(r => r.json()).then(slaves => {
+    const s = slaves.find(x => x.id === id);
+    if (!s) return;
+    currentSlaveId = id;
+    document.getElementById('slaveSettingsId').value = id;
+    document.getElementById('slaveSettingsName').value = s.name || '';
+    document.getElementById('slaveSettingsStatus').value = s.status || '';
+    document.getElementById('slaveSettingsIP').value = s.ip || '';
+    document.getElementById('slaveSettingsLastSeen').value = timeSince(s.last_seen);
+    
+    const ss = s.system_stats || {};
+    document.getElementById('slaveStatsCPU').textContent = ss.cpu_load_1m !== undefined ? ss.cpu_load_1m.toFixed(1) : '—';
+    document.getElementById('slaveStatsRAM').textContent = ss.ram_percent !== undefined ? `${ss.ram_percent}%` : '—';
+    document.getElementById('slaveStatsDisk').textContent = ss.disk_percent !== undefined ? `${ss.disk_percent}%` : '—';
+    
+    // Show/hide pause/resume buttons based on status
+    const isPaused = s.status === 'paused';
+    document.getElementById('slaveBtnPause').style.display = isPaused ? 'none' : 'inline-flex';
+    document.getElementById('slaveBtnResume').style.display = isPaused ? 'inline-flex' : 'none';
+    
+    document.getElementById('slaveSettingsModal').classList.add('active');
+  });
+}
+
+function closeSlaveSettings() {
+  document.getElementById('slaveSettingsModal').classList.remove('active');
+  currentSlaveId = null;
+}
+
+async function saveSlaveSettings() {
+  if (!currentSlaveId) return;
+  const name = document.getElementById('slaveSettingsName').value.trim();
+  if (!name) { toast('Name is required', 'error'); return; }
+  try {
+    const r = await fetch(`/api/slaves/${currentSlaveId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      toast('Slave settings saved', 'success');
+      closeSlaveSettings();
+      refreshSlaves();
+    }
+  } catch (e) {
+    toast('Failed to save settings', 'error');
+  }
+}
+
+async function restartSlaveService() {
+  if (!currentSlaveId) return;
+  if (!confirm('Restart the scraper-slave service? This will clear memory.')) return;
+  try {
+    const r = await fetch(`/api/slaves/${currentSlaveId}/restart-service`, { method: 'POST' });
+    const d = await r.json();
+    toast(d.message || 'Service restarted', d.ok ? 'success' : 'error');
+    addLog(`Slave service restarted: ${d.message}`, d.ok ? 'log-success' : 'log-error');
+  } catch (e) {
+    toast('Failed to restart service', 'error');
+  }
+}
+
+async function pauseSlave() {
+  if (!currentSlaveId) return;
+  try {
+    const r = await fetch(`/api/slaves/${currentSlaveId}/pause`, { method: 'POST' });
+    const d = await r.json();
+    toast(d.message || 'Slave paused', d.ok ? 'success' : 'error');
+    if (d.ok) {
+      document.getElementById('slaveBtnPause').style.display = 'none';
+      document.getElementById('slaveBtnResume').style.display = 'inline-flex';
+      refreshSlaves();
+    }
+  } catch (e) {
+    toast('Failed to pause slave', 'error');
+  }
+}
+
+async function resumeSlave() {
+  if (!currentSlaveId) return;
+  try {
+    const r = await fetch(`/api/slaves/${currentSlaveId}/resume`, { method: 'POST' });
+    const d = await r.json();
+    toast(d.message || 'Slave resumed', d.ok ? 'success' : 'error');
+    if (d.ok) {
+      document.getElementById('slaveBtnPause').style.display = 'inline-flex';
+      document.getElementById('slaveBtnResume').style.display = 'none';
+      refreshSlaves();
+    }
+  } catch (e) {
+    toast('Failed to resume slave', 'error');
+  }
+}
+
+async function rebootSlave() {
+  if (!currentSlaveId) return;
+  if (!confirm('Reboot the slave VPS? This will take the slave offline temporarily.')) return;
+  try {
+    const r = await fetch(`/api/slaves/${currentSlaveId}/reboot`, { method: 'POST' });
+    const d = await r.json();
+    toast(d.message || 'Reboot initiated', d.ok ? 'success' : 'error');
+    addLog(`Slave VPS reboot: ${d.message}`, d.ok ? 'log-info' : 'log-error');
+    if (d.ok) {
+      closeSlaveSettings();
+      setTimeout(refreshSlaves, 3000);
+    }
+  } catch (e) {
+    toast('Failed to reboot', 'error');
+  }
+}
+
+async function removeSlaveConfirm() {
+  if (!currentSlaveId) return;
+  if (!confirm('Remove this slave from the master?')) return;
+  await fetch(`/api/slaves/${currentSlaveId}`, { method: 'DELETE' });
+  toast('Slave removed', 'info');
+  closeSlaveSettings();
+  refreshSlaves();
+}
+
 // ── Slaves ──
 async function removeSlave(id){if(!confirm('Remove this slave?'))return;await fetch(`/api/slaves/${id}`,{method:'DELETE'});toast('Slave removed','info');refreshSlaves()}
 async function refreshSlaves(){
@@ -214,7 +383,7 @@ async function refreshSlaves(){
       const statusCls=s.status==='provisioning'?'processing':s.status;
       const provBadge=s.status==='provisioning'?` <span class="spinner" style="margin-left:4px"></span>`:'';
       return`<tr>
-        <td><strong>${esc(s.name)}</strong></td>
+        <td><a href="#" onclick="openSlaveSettings('${s.id}');return false" style="color:var(--accent-primary);text-decoration:none"><strong>${esc(s.name)}</strong></a></td>
         <td><code style="font-size:0.75rem;color:var(--text-muted)">${esc(s.ip||'')} · :${esc(s.url.split(':').pop())}</code></td>
         <td><span class="badge badge-${statusCls}">${s.status}</span>${provBadge}</td>
         <td style="font-family:var(--font-mono);font-size:0.82rem">${cpu}</td>
@@ -223,7 +392,7 @@ async function refreshSlaves(){
         <td>${s.domains_assigned}</td><td>${s.domains_done}</td>
         <td style="color:var(--success);font-weight:600">${s.emails_found}</td>
         <td style="font-size:0.75rem;color:var(--text-muted)">${timeSince(s.last_seen)}</td>
-        <td><button class="btn btn-danger btn-sm" onclick="removeSlave('${s.id}')">✕</button></td>
+        <td><button class="btn btn-ghost btn-sm" onclick="openSlaveSettings('${s.id}')" title="Settings">⚙️</button> <button class="btn btn-danger btn-sm" onclick="removeSlave('${s.id}')" title="Remove">✕</button></td>
       </tr>`}).join('');
   }catch{}
 }

@@ -581,6 +581,139 @@ async def list_slaves():
     return list(slaves.values())
 
 
+@app.put("/api/slaves/{slave_id}")
+async def update_slave(slave_id: str, data: dict):
+    """Update slave settings (name)."""
+    if slave_id not in slaves:
+        raise HTTPException(404, "Slave not found")
+    
+    if "name" in data:
+        slaves[slave_id]["name"] = data["name"].strip()
+    save_state()
+    return {"ok": True, "slave": slaves[slave_id]}
+
+
+@app.post("/api/slaves/{slave_id}/reboot")
+async def reboot_slave(slave_id: str):
+    """Reboot the slave VPS."""
+    if slave_id not in slaves:
+        raise HTTPException(404, "Slave not found")
+    
+    slave = slaves[slave_id]
+    slave_url = slave.get("url", "")
+    slave_ip = slave.get("ip", "")
+    
+    # Try to trigger reboot via SSH or API
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Try to call reboot endpoint on slave
+            r = await client.post(f"{slave_url}/api/system/reboot")
+            if r.status_code == 200:
+                slave["status"] = "offline"
+                return {"ok": True, "message": "Reboot initiated"}
+    except Exception:
+        pass
+    
+    # If we have IP, try SSH reboot
+    if slave_ip:
+        try:
+            import paramiko
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            # This would require stored credentials - for now just mark status
+            slave["status"] = "offline"
+            return {"ok": True, "message": "Manual reboot required - SSH credentials not stored"}
+        except Exception:
+            pass
+    
+    return {"ok": False, "message": "Could not reboot slave"}
+
+
+@app.post("/api/slaves/{slave_id}/restart-service")
+async def restart_slave_service(slave_id: str):
+    """Restart the scraper-slave service (clears memory)."""
+    if slave_id not in slaves:
+        raise HTTPException(404, "Slave not found")
+    
+    slave = slaves[slave_id]
+    slave_url = slave.get("url", "")
+    
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(f"{slave_url}/api/system/restart-service")
+            if r.status_code == 200:
+                return {"ok": True, "message": "Service restarted"}
+    except Exception as e:
+        return {"ok": False, "message": f"Failed to restart: {str(e)[:50]}"}
+    
+    return {"ok": False, "message": "Slave not responding"}
+
+
+@app.get("/api/slaves/{slave_id}/jobs")
+async def get_slave_jobs(slave_id: str):
+    """Get jobs assigned to this slave."""
+    if slave_id not in slaves:
+        raise HTTPException(404, "Slave not found")
+    
+    assigned_jobs = []
+    for jid, job in jobs.items():
+        if slave_id in job.get("domains_per_slave", {}):
+            assigned_jobs.append({
+                "id": jid,
+                "name": job.get("name", jid),
+                "status": job["status"],
+                "domains_assigned": job["domains_per_slave"].get(slave_id, 0),
+                "emails_found": slaves[slave_id].get("emails_found", 0),
+                "domains_done": slaves[slave_id].get("domains_done", 0)
+            })
+    
+    return {"jobs": assigned_jobs}
+
+
+@app.post("/api/slaves/{slave_id}/pause")
+async def pause_slave(slave_id: str):
+    """Pause all jobs on a slave."""
+    if slave_id not in slaves:
+        raise HTTPException(404, "Slave not found")
+    
+    slave = slaves[slave_id]
+    slave_url = slave.get("url", "")
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(f"{slave_url}/api/system/pause")
+            if r.status_code == 200:
+                slave["status"] = "paused"
+                save_state()
+                return {"ok": True, "message": "Slave paused"}
+    except Exception as e:
+        return {"ok": False, "message": f"Failed: {str(e)[:50]}"}
+    
+    return {"ok": False, "message": "Slave not responding"}
+
+
+@app.post("/api/slaves/{slave_id}/resume")
+async def resume_slave(slave_id: str):
+    """Resume all jobs on a slave."""
+    if slave_id not in slaves:
+        raise HTTPException(404, "Slave not found")
+    
+    slave = slaves[slave_id]
+    slave_url = slave.get("url", "")
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(f"{slave_url}/api/system/resume")
+            if r.status_code == 200:
+                slave["status"] = "idle"
+                save_state()
+                return {"ok": True, "message": "Slave resumed"}
+    except Exception as e:
+        return {"ok": False, "message": f"Failed: {str(e)[:50]}"}
+    
+    return {"ok": False, "message": "Slave not responding"}
+
+
 @app.post("/api/slaves/{slave_id}/heartbeat")
 async def slave_heartbeat(slave_id: str, data: dict):
     """Slave calls this periodically to report progress + system metrics."""

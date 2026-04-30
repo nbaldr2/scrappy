@@ -163,11 +163,11 @@ async def _dns_check_async(host: str, resolver=None) -> bool:
             await asyncio.wait_for(resolver.query(host, 'A'), timeout=DNS_TIMEOUT)
             return True
         except Exception:
-            return False
-    else:
-        # Fallback to sync socket in thread
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _dns_check_sync, host)
+            # aiodns failed, fall back to sync socket method
+            pass
+    # Fallback to sync socket in thread (always available)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _dns_check_sync, host)
 
 def _dns_check_sync(host: str) -> bool:
     """Synchronous DNS check using socket."""

@@ -672,13 +672,13 @@ def _heartbeat_loop():
         if shutdown_event.is_set():
             break
 
-        # Determine current status
-        if active_jobs:
-            # Check if any job is still scraping
-            scraping = any(j["status"] == "scraping" for j in active_jobs.values())
+        # Determine current status from active (in-progress) jobs only
+        active = [j for j in active_jobs.values() if j.get("status") in ("starting", "scraping")]
+        if active:
+            scraping = any(j.get("status") == "scraping" for j in active)
             status = "scraping" if scraping else "idle"
-            total_done = sum(j.get("domains_done", 0) for j in active_jobs.values())
-            total_emails = sum(j.get("emails_found", 0) for j in active_jobs.values())
+            total_done = sum(j.get("domains_done", 0) for j in active)
+            total_emails = sum(j.get("emails_found", 0) for j in active)
         else:
             status = "idle"
             total_done = 0

@@ -522,14 +522,35 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
         if venv_ok.endswith("OK"):
             log("✓ Python venv and packages already installed — skipping")
         else:
-            _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv --clear", timeout=60)
+            # Try to create venv with error checking
+            try:
+                _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv --clear", timeout=60, check=True)
+            except RuntimeError as e:
+                log(f"⚠ venv creation failed: {str(e)[:100]}")
+                # Likely missing python3.X-venv package, try to install it
+                log("Installing python3-venv package...")
+                py_ver = _exec(ssh, "python3 -c 'import sys; print(f\"python3.{sys.version_info.minor}-venv\")'", timeout=10).strip()
+                try:
+                    _exec(ssh, f"apt-get update -qq && apt-get install -y {py_ver} --no-install-recommends -qq", timeout=300, check=True)
+                    log(f"✓ {py_ver} installed, retrying venv creation...")
+                    _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv --clear", timeout=60, check=True)
+                except RuntimeError as apt_err:
+                    log(f"✗ Failed to install {py_ver}: {str(apt_err)[:100]}")
+                    raise
+            
             # Verify venv was created successfully
             venv_check = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/pip && echo OK || echo FAIL", timeout=10).strip()
             if venv_check != "OK":
-                log("⚠ venv creation failed, trying with --without-pip...")
+                log("⚠ pip not found in venv, trying --without-pip fallback...")
                 _exec(ssh, f"rm -rf {REMOTE_DIR}/venv && cd {REMOTE_DIR} && python3 -m venv venv --without-pip", timeout=60)
                 # Install pip via get-pip.py
                 _exec(ssh, f"cd {REMOTE_DIR} && curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py && {REMOTE_DIR}/venv/bin/python get-pip.py && rm get-pip.py", timeout=120)
+            
+            # Final verification before installing packages
+            final_check = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/pip && echo OK || echo FAIL", timeout=10).strip()
+            if final_check != "OK":
+                raise RuntimeError("venv/bin/pip does not exist after all attempts")
+            
             log("Installing Python packages (may take 30-90s)...")
             _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q && "
                         f"venv/bin/pip install --no-cache-dir -r requirements.txt -q",
@@ -627,15 +648,14 @@ WantedBy=multi-user.target
         ssh.close()
 
 
-def _exec(ssh: paramiko.SSHClient, cmd: str, timeout: int = 30) -> str:
-    """Execute command via SSH, return stdout. Raises on non-zero exit."""
+def _exec(ssh: paramiko.SSHClient, cmd: str, timeout: int = 30, check: bool = False) -> str:
+    """Execute command via SSH, return stdout. If check=True, raises on non-zero exit."""
     _, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
     exit_code = stdout.channel.recv_exit_status()
     out = stdout.read().decode("utf-8", errors="ignore")
     err = stderr.read().decode("utf-8", errors="ignore")
-    if exit_code != 0 and err.strip():
-        # Log stderr but don't raise for non-critical warnings
-        pass
+    if check and exit_code != 0:
+        raise RuntimeError(f"Command failed (exit={exit_code}): {cmd}\nstderr: {err[:200]}")
     return out
 
 

@@ -47,17 +47,31 @@ RESULT_DIR.mkdir(exist_ok=True)
 # ── Provisioning logs:  {slave_id: [log_lines]} ────────────────────────────────
 provision_logs: dict[str, list] = {}
 
+# ── In-memory slaves cache for provisioning (synced with database) ─────────────
+slaves: dict[str, dict] = {}
+
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - startup and shutdown events."""
+    global _monitor_task
     # Startup
     print("Initializing database...")
     await db.init_database()
     print("Database connected and tables created")
+    # Start heartbeat monitor
+    _monitor_task = asyncio.create_task(_heartbeat_monitor())
+    print("Heartbeat monitor started")
     yield
     # Shutdown
+    print("Stopping heartbeat monitor...")
+    if _monitor_task:
+        _monitor_task.cancel()
+        try:
+            await _monitor_task
+        except asyncio.CancelledError:
+            pass
     print("Closing database connection...")
     await db.close_database()
 
@@ -608,14 +622,6 @@ async def _heartbeat_monitor():
 
                     if elapsed > HEARTBEAT_TIMEOUT:
                         s["status"] = "offline"
-
-
-@app.on_event("startup")
-async def start_monitor():
-    global _monitor_task
-    # Load persisted state on startup
-    load_state()
-    _monitor_task = asyncio.create_task(_heartbeat_monitor())
 
 
 # ── Slave Management ───────────────────────────────────────────────────────────

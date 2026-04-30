@@ -131,8 +131,11 @@ async def init_database():
     """Initialize database connection and create tables."""
     await db.connect()
     
-    # Create tables
-    await db.execute(CREATE_TABLES_SQL)
+    # Create tables - execute each statement separately (asyncpg doesn't support multi-statement)
+    # Split by semicolon and execute each non-empty statement
+    statements = [s.strip() for s in CREATE_TABLES_SQL.split(';') if s.strip()]
+    for statement in statements:
+        await db.execute(statement)
     
     # Insert default settings if not exist
     await _init_default_settings()

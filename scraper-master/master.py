@@ -1352,6 +1352,35 @@ async def rename_job(job_id: str, data: dict):
     return {"ok": True, "name": new_name}
 
 
+# ── Activity Logs API ─────────────────────────────────────────────────────────
+
+@app.get("/api/logs")
+async def get_logs(limit: int = 200, offset: int = 0, category: str = None, level: str = None):
+    """Get activity logs from DB (newest first)."""
+    logs = await db.get_activity_logs(
+        category=category, level=level, limit=limit, offset=offset
+    )
+    return {"ok": True, "logs": logs, "total": len(logs)}
+
+
+@app.post("/api/logs")
+async def add_log(data: dict):
+    """Save a single log entry from the UI."""
+    message = data.get("message", "")
+    level = data.get("level", "info")
+    category = data.get("category", "ui")
+    if message:
+        await db.log_activity(level, category, message)
+    return {"ok": True}
+
+
+@app.delete("/api/logs")
+async def clear_logs():
+    """Clear all activity logs from DB."""
+    await db.db.execute("DELETE FROM activity_logs")
+    return {"ok": True, "message": "All activity logs cleared"}
+
+
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)

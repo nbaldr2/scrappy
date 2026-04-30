@@ -74,7 +74,7 @@
   <section class="section fade-in">
     <div class="section-header"><h2><span class="icon">📜</span> Activity Log</h2><button class="btn btn-ghost btn-sm" onclick="clearLogs()">Clear</button></div>
     <div class="log-terminal" id="logTerminal">
-      <div class="log-entry"><span class="log-time">[system]</span> <span class="log-info">Dashboard ready</span></div>
+      <div class="log-entry"><span class="log-time">[system]</span> <span class="log-info">Loading logs…</span></div>
     </div>
   </section>
 </div>
@@ -188,8 +188,39 @@ let totalPages = 1;
 let totalJobs = 0;
 
 function toast(msg,type='info'){const c=document.getElementById('toasts'),t=document.createElement('div');t.className=`toast toast-${type}`;const icon={'success':'✅','error':'❌','info':'ℹ️'}[type]||'ℹ️';t.innerHTML=`${icon} ${msg}`;c.appendChild(t);setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),300)},4000)}
-function addLog(msg,cls='log-info'){const t=document.getElementById('logTerminal'),e=document.createElement('div');e.className='log-entry';e.innerHTML=`<span class="log-time">[${new Date().toLocaleTimeString()}]</span> <span class="${cls}">${msg}</span>`;t.appendChild(e);t.scrollTop=t.scrollHeight}
-function clearLogs(){document.getElementById('logTerminal').innerHTML=''}
+function addLog(msg,cls='log-info'){
+  const t=document.getElementById('logTerminal'),e=document.createElement('div');
+  e.className='log-entry';
+  e.innerHTML=`<span class="log-time">[${new Date().toLocaleTimeString()}]</span> <span class="${cls}">${msg}</span>`;
+  t.insertBefore(e,t.firstChild);
+  // Persist to DB
+  const lvl=cls==='log-error'?'error':cls==='log-success'?'info':'info';
+  fetch('/api/logs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,level:lvl,category:'ui'})}).catch(()=>{});
+}
+async function clearLogs(){
+  document.getElementById('logTerminal').innerHTML='';
+  try{await fetch('/api/logs',{method:'DELETE'});}catch(e){}
+}
+async function loadLogsFromDB(){
+  try{
+    const r=await fetch('/api/logs?limit=200');
+    const d=await r.json();
+    const t=document.getElementById('logTerminal');
+    t.innerHTML='';
+    if(d.logs && d.logs.length){
+      d.logs.forEach(log=>{
+        const e=document.createElement('div');
+        e.className='log-entry';
+        const ts=log.created_at?new Date(log.created_at).toLocaleTimeString():'--:--:--';
+        const cls=log.level==='error'?'log-error':log.level==='warning'?'log-warning':'log-info';
+        e.innerHTML=`<span class="log-time">[${ts}]</span> <span class="${cls}">${esc(log.message)}</span>`;
+        t.appendChild(e);
+      });
+    } else {
+      t.innerHTML='<div class="log-entry"><span class="log-time">[system]</span> <span class="log-info">No activity logs yet</span></div>';
+    }
+  }catch(e){console.error('Failed to load logs',e);}
+}
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
 function formatTime(iso){if(!iso)return'—';try{return new Date(iso).toLocaleTimeString()}catch{return iso}}
 function timeSince(iso){if(!iso)return'—';try{const s=Math.floor((Date.now()-new Date(iso).getTime())/1000);if(s<10)return'just now';if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago'}catch{return'—'}}
@@ -516,7 +547,10 @@ function formatDuration(seconds) {
 function goToPage(p){currentPage=p;refreshJobs()}
 
 // Initialize
-refreshSlaves();refreshJobs();setInterval(()=>{refreshSlaves();refreshJobs()},5000);
+loadLogsFromDB();
+refreshSlaves();refreshJobs();
+setInterval(()=>{refreshSlaves();refreshJobs()},5000);
+setInterval(loadLogsFromDB,30000);
 </script>
 </body>
 </html>

@@ -188,10 +188,11 @@ def clean_domains(raw_lines: list[str], phase2: bool = True) -> tuple[list[str],
 
 # ── DNS Pre-Filter (Robust Multi-Record-Type with Retry) ──────────────────────
 
-DNS_TIMEOUT = 5.0  # 5 seconds timeout for DNS resolution (was 3s, too aggressive)
-DNS_MAX_WORKERS = 500  # Reduced from 2000 to avoid overwhelming DNS resolvers
-DNS_MAX_RETRIES = 2  # Retry failed lookups once
-DNS_RETRY_DELAY = 0.5  # Delay between retries
+DNS_TIMEOUT = 3.0  # 3 seconds timeout for DNS resolution
+DNS_MAX_WORKERS = 1000  # 1000 concurrent workers
+DNS_MAX_RETRIES = 1  # 1 retry for failed lookups
+DNS_RETRY_DELAY = 0.3  # 300ms delay between retries
+BATCH_SIZE = 2000  # Process in 2000-domain batches
 
 # Global cancellation flags for jobs
 job_cancel_flags: dict[str, bool] = {}
@@ -269,20 +270,9 @@ async def _dns_check_async_robust(host: str, resolver=None) -> bool:
 def _dns_check_sync_robust(host: str) -> bool:
     """
     Synchronous robust DNS check using socket.
-    Tries both IPv4 and IPv6, and handles edge cases better.
+    Tries both IPv4 and IPv6.
     """
     orig = socket.getdefaulttimeout()
-    
-    # Clean the hostname - remove any accidental protocols or paths
-    host = host.strip().lower()
-    if host.startswith(('http://', 'https://')):
-        host = host.split('://', 1)[1].split('/')[0]
-    if ':' in host:
-        host = host.split(':')[0]  # Remove port if present
-    
-    # Skip invalid hostnames
-    if not host or '.' not in host or len(host) > 253:
-        return False
     
     try:
         socket.setdefaulttimeout(DNS_TIMEOUT)
@@ -384,8 +374,7 @@ async def dns_filter_async(domains: list[str], job_id: str = None) -> tuple[list
             
             return result, domain
     
-    # Process in smaller batches to avoid overwhelming the system
-    BATCH_SIZE = 1000
+    # Process in batches
     all_tasks = []
     
     for i in range(0, len(domains), BATCH_SIZE):
@@ -395,7 +384,7 @@ async def dns_filter_async(domains: list[str], job_id: str = None) -> tuple[list
         
         # Brief pause between batch creation to allow DNS resolver recovery
         if i + BATCH_SIZE < len(domains):
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
     
     # Run with progress updates
     async def update_progress():

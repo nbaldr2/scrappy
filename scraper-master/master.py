@@ -188,8 +188,8 @@ def clean_domains(raw_lines: list[str], phase2: bool = True) -> tuple[list[str],
 
 # ── DNS Pre-Filter (Ultra High-Performance) ─────────────────────────────────────
 
-DNS_TIMEOUT = 1.0  # Reduced from 2s for faster timeout
-DNS_MAX_WORKERS = 2000  # Increased from 500 for ultra-fast processing
+DNS_TIMEOUT = 3.0  # 3 seconds timeout for DNS resolution
+DNS_MAX_WORKERS = 2000  # High concurrency for fast processing
 
 # Global cancellation flags for jobs
 job_cancel_flags: dict[str, bool] = {}

@@ -539,6 +539,12 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
         # 5. Create systemd service
         log("Configuring systemd service...")
         slaves[sid]["provision_progress"] = "configuring"
+        
+        # Stop any existing service first to clear old SLAVE_ID
+        _exec(ssh, "systemctl stop scraper-slave 2>/dev/null || true")
+        # Kill any leftover python processes on the slave port
+        _exec(ssh, f"pkill -f 'uvicorn.*slave:app.*{slave_port}' 2>/dev/null || true")
+        
         service_content = f"""[Unit]
 Description=Scraper Slave Agent - {slave_name}
 After=network.target
@@ -561,8 +567,8 @@ WantedBy=multi-user.target
         _exec(ssh, f"cat > /etc/systemd/system/scraper-slave.service << 'SERVICEEOF'\n"
                     f"{service_content}SERVICEEOF")
         _exec(ssh, "systemctl daemon-reload && systemctl enable scraper-slave && "
-                    "systemctl restart scraper-slave")
-        log("✓ Service started")
+                    "systemctl start scraper-slave")
+        log("✓ Service started with fresh SLAVE_ID")
 
         # 6. Open firewall port
         log("Opening firewall...")

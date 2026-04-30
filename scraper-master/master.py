@@ -507,13 +507,21 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
             has_venv = _exec(ssh, f"dpkg -l {py_ver} 2>/dev/null | grep -q ^ii && echo YES || echo NO", timeout=10).strip()
             if has_venv != "YES":
                 log(f"Installing {py_ver} (may take 30-60s)...")
-                _exec(ssh, f"apt-get update -qq && apt-get install -y {py_ver} --no-install-recommends -qq", timeout=300)
-                log(f"✓ {py_ver} installed")
+                try:
+                    _exec(ssh, f"apt-get update -qq && apt-get install -y {py_ver} --no-install-recommends -qq", timeout=300, check=True)
+                    log(f"✓ {py_ver} installed")
+                except RuntimeError as apt_err:
+                    log(f"✗ Failed to install {py_ver}: {str(apt_err)[:100]}")
+                    raise
         else:
             log("Installing python3 + venv (may take 60-120s on fresh VPS)...")
-            _exec(ssh, "apt-get update -qq && apt-get install -y python3 python3-venv python3.12-venv --no-install-recommends -qq",
-                  timeout=300)
-            log("✓ Python3 installed")
+            try:
+                _exec(ssh, "apt-get update -qq && apt-get install -y python3 python3-venv python3.12-venv --no-install-recommends -qq",
+                      timeout=300, check=True)
+                log("✓ Python3 installed")
+            except RuntimeError as apt_err:
+                log(f"✗ Failed to install python3: {str(apt_err)[:100]}")
+                raise
 
         # 4. Create venv + install Python deps (skip if venv already has everything)
         log("Setting up Python environment...")

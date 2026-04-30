@@ -952,22 +952,28 @@ async def slave_heartbeat(slave_id: str, data: dict):
 @app.post("/api/jobs/upload")
 async def upload_domains(file: UploadFile = File(...), name: str = Form(None)):
     """Upload domain list — stored for processing."""
-    content = (await file.read()).decode("utf-8", errors="ignore")
-    lines = content.strip().splitlines()
-    job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:6]
-    fpath = UPLOAD_DIR / f"{job_id}.txt"
-    fpath.write_text(content, encoding="utf-8")
-    
-    # Generate name from filename if not provided
-    if not name:
-        name = file.filename.rsplit('.', 1)[0] if file.filename else f"Job {job_id[:13]}"
-    
-    # Create job in database
-    domains_raw = len([l for l in lines if l.strip() and not l.startswith('#')])
-    await db.create_job(job_id, name, str(fpath))
-    await db.update_job(job_id, domains_total=domains_raw)
-    
-    return {"ok": True, "job_id": job_id, "name": name, "domains_raw": domains_raw}
+    try:
+        content = (await file.read()).decode("utf-8", errors="ignore")
+        lines = content.strip().splitlines()
+        job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:6]
+        fpath = UPLOAD_DIR / f"{job_id}.txt"
+        fpath.write_text(content, encoding="utf-8")
+        
+        # Generate name from filename if not provided
+        if not name:
+            name = file.filename.rsplit('.', 1)[0] if file.filename else f"Job {job_id[:13]}"
+        
+        # Create job in database
+        domains_raw = len([l for l in lines if l.strip() and not l.startswith('#')])
+        await db.create_job(job_id, name, str(fpath))
+        await db.update_job(job_id, domains_total=domains_raw)
+        
+        return {"ok": True, "job_id": job_id, "name": name, "domains_raw": domains_raw}
+    except Exception as e:
+        import traceback
+        error_detail = f"{str(e)}\n{traceback.format_exc()}"
+        print(f"[ERROR] Upload failed: {error_detail}")
+        raise HTTPException(500, f"Upload failed: {str(e)}")
 
 
 @app.post("/api/jobs/{job_id}/start")

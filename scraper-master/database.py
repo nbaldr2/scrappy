@@ -134,8 +134,16 @@ async def init_database():
     # Create tables - execute each statement separately (asyncpg doesn't support multi-statement)
     # Split by semicolon and execute each non-empty statement
     statements = [s.strip() for s in CREATE_TABLES_SQL.split(';') if s.strip()]
-    for statement in statements:
-        await db.execute(statement)
+    for i, statement in enumerate(statements):
+        try:
+            await db.execute(statement)
+        except Exception as e:
+            # Ignore "already exists" errors, raise others
+            if "already exists" in str(e).lower():
+                continue
+            print(f"[DB INIT] Failed on statement {i}: {str(e)[:100]}")
+            print(f"[DB INIT] Statement: {statement[:200]}")
+            raise
     
     # Insert default settings if not exist
     await _init_default_settings()

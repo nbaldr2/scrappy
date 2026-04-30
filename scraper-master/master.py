@@ -917,7 +917,7 @@ async def start_job(job_id: str, workers: int = 12, turbo: bool = True,
     if not active_slaves:
         raise HTTPException(400, "No active slaves available — provision or check connections")
 
-    await db.update_job(job_id, status="processing", started_at=datetime.now().isoformat(), error=None)
+    await db.update_job(job_id, status="processing", started_at=datetime.now(), error=None)
 
     asyncio.create_task(_run_job(job_id, workers, turbo, dns_on))
     return {"ok": True, "status": "processing"}
@@ -947,7 +947,7 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool):
             await db.update_job(job_id, domains_live=len(live))
 
         if not live:
-            await db.update_job(job_id, status="completed", finished_at=datetime.now().isoformat())
+            await db.update_job(job_id, status="completed", finished_at=datetime.now())
             return
 
         # 4. Split across active slaves
@@ -1120,7 +1120,7 @@ async def _poll_until_done(job_id: str):
     job_status = job.get("status")
     if job_status != "cancelled":
         await db.update_job(job_id, status="completed")
-    await db.update_job(job_id, finished_at=datetime.now().isoformat())
+    await db.update_job(job_id, finished_at=datetime.now())
     
     # Save final emails to file
     emails = await db.get_emails(job_id)
@@ -1216,7 +1216,7 @@ async def cancel_job(job_id: str):
     job_cancel_flags[job_id] = True
     await db.update_job(job_id, 
         status="cancelled",
-        finished_at=datetime.now().isoformat(),
+        finished_at=datetime.now(),
         error="Job cancelled by user"
     )
     

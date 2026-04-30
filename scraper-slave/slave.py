@@ -54,6 +54,10 @@ shutdown_event = threading.Event()
 # ── Active jobs ────────────────────────────────────────────────────────────────
 active_jobs: dict[str, dict] = {}
 
+# ── Job cancellation flags ─────────────────────────────────────────────────────
+job_cancelled: dict[str, bool] = {}
+job_cancel_lock = threading.Lock()
+
 # ── UA Pool ────────────────────────────────────────────────────────────────────
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -330,6 +334,18 @@ def crawl(session, site_url, max_pages=6, early_exit=2, turbo=False):
     return found_emails
 
 
+def is_job_cancelled(job_id: str) -> bool:
+    """Check if a job has been cancelled."""
+    with job_cancel_lock:
+        return job_cancelled.get(job_id, False)
+
+
+def set_job_cancelled(job_id: str, cancelled: bool = True):
+    """Set cancellation flag for a job."""
+    with job_cancel_lock:
+        job_cancelled[job_id] = cancelled
+
+
 def process_domain(domain, turbo=False):
     session = get_session(turbo=turbo)
     try:
@@ -351,6 +367,9 @@ def run_scrape_job(job_id: str, domains: list, workers: int, turbo: bool):
     done_count = 0
     total = len(domains)
     email_buffer = []
+
+    # Reset cancellation flag when starting
+    set_job_cancelled(job_id, False)
 
     def _report_to_master(emails_batch, done, force=False):
         """Send batch of emails to master."""
@@ -380,6 +399,10 @@ def run_scrape_job(job_id: str, domains: list, workers: int, turbo: bool):
             def fill():
                 nonlocal exhausted
                 while len(pending) < MAX_PENDING and not exhausted and not shutdown_event.is_set():
+                    # Check for cancellation
+                    if is_job_cancelled(job_id):
+                        exhausted = True
+                        return
                     try:
                         d = next(it)
                         pending[ex.submit(process_domain, d, turbo)] = d
@@ -387,7 +410,7 @@ def run_scrape_job(job_id: str, domains: list, workers: int, turbo: bool):
                         exhausted = True
 
             fill()
-            while pending and not shutdown_event.is_set():
+            while pending and not shutdown_event.is_set() and not is_job_cancelled(job_id):
                 done_set, _ = wait(list(pending.keys()), timeout=2, return_when=FIRST_COMPLETED)
                 for fut in done_set:
                     pending.pop(fut)
@@ -409,8 +432,17 @@ def run_scrape_job(job_id: str, domains: list, workers: int, turbo: bool):
                 job["domains_done"] = done_count
                 job["emails_found"] = len(all_emails)
                 job["emails"] = list(all_emails)
+                
+                # Check for cancellation before filling
+                if is_job_cancelled(job_id):
+                    break
+                    
                 if not shutdown_event.is_set():
                     fill()
+
+            # Cancel any remaining pending futures
+            for f in pending:
+                f.cancel()
 
     except Exception as e:
         job["error"] = str(e)
@@ -419,7 +451,13 @@ def run_scrape_job(job_id: str, domains: list, workers: int, turbo: bool):
     _report_to_master(email_buffer[:], done_count, force=True)
     email_buffer.clear()
 
-    job["status"] = "completed"
+    # Set final status based on cancellation
+    if is_job_cancelled(job_id):
+        job["status"] = "cancelled"
+        job["error"] = "Job cancelled by master"
+    else:
+        job["status"] = "completed"
+    
     job["domains_done"] = done_count
     job["emails_found"] = len(all_emails)
     job["emails"] = list(all_emails)
@@ -474,6 +512,24 @@ async def job_status(job_id: str):
         "emails": j["emails"],
         "error": j.get("error"),
     }
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Cancel a running job on this slave."""
+    if job_id not in active_jobs:
+        raise HTTPException(404, "Job not found on this slave")
+    
+    job = active_jobs[job_id]
+    
+    # Only allow cancelling jobs that are actively scraping
+    if job["status"] not in ("starting", "scraping"):
+        return {"ok": False, "message": f"Job is {job['status']}, cannot cancel"}
+    
+    # Set the cancellation flag - this will be picked up by run_scrape_job
+    set_job_cancelled(job_id, True)
+    
+    return {"ok": True, "message": "Cancellation signal sent"}
 
 
 @app.get("/api/health")

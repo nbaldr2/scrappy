@@ -899,6 +899,8 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool):
 
 async def _poll_until_done(job_id: str):
     """Poll slave progress until all done with progress tracking."""
+    global job_cancel_flags
+    
     job = jobs[job_id]
     active = {k: v for k, v in slaves.items()
               if k in job["domains_per_slave"]}
@@ -910,9 +912,17 @@ async def _poll_until_done(job_id: str):
     
     while True:
         await asyncio.sleep(5)
+        
+        # Check if job was cancelled
+        if job_cancel_flags.get(job_id, False) or job.get("status") == "cancelled":
+            job["status"] = "cancelled"
+            save_state()
+            return
+        
         all_done = True
         total_emails = []
         total_done = 0
+        any_scraping = False
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             for sid, sinfo in active.items():
@@ -925,8 +935,11 @@ async def _poll_until_done(job_id: str):
                     sinfo["last_seen"] = datetime.now().isoformat()
                     total_done += data.get("domains_done", 0)
 
-                    if data.get("status") not in ("completed", "failed"):
+                    status = data.get("status", "unknown")
+                    if status not in ("completed", "failed", "cancelled"):
                         all_done = False
+                    if status == "scraping":
+                        any_scraping = True
                     if data.get("emails"):
                         total_emails.extend(data["emails"])
                 except Exception:
@@ -954,10 +967,13 @@ async def _poll_until_done(job_id: str):
         
         save_state()  # Save progress periodically
 
-        if all_done:
+        # If all slaves report done/cancelled/failed, exit
+        if all_done and not any_scraping:
             break
 
-    job["status"] = "completed"
+    # Only mark as completed if not cancelled
+    if job.get("status") != "cancelled":
+        job["status"] = "completed"
     job["finished_at"] = datetime.now().isoformat()
 
     result_file = RESULT_DIR / f"{job_id}_emails.txt"
@@ -1050,7 +1066,7 @@ async def get_job(job_id: str):
 
 @app.post("/api/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
-    """Cancel a running job."""
+    """Cancel a running job and notify all slaves to stop."""
     global job_cancel_flags
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
@@ -1065,7 +1081,38 @@ async def cancel_job(job_id: str):
     job["finished_at"] = datetime.now().isoformat()
     job["error"] = "Job cancelled by user"
     
+    # Notify all slaves to cancel this job
+    await _notify_slaves_cancel(job_id)
+    
     return {"ok": True, "status": "cancelled"}
+
+
+async def _notify_slaves_cancel(job_id: str):
+    """Send cancellation signal to all slaves working on a job."""
+    job = jobs.get(job_id)
+    if not job:
+        return
+    
+    # Get slaves assigned to this job
+    assigned_slaves = list(job.get("domains_per_slave", {}).keys())
+    if not assigned_slaves:
+        return
+    
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        tasks = []
+        for sid in assigned_slaves:
+            if sid in slaves:
+                slave_url = slaves[sid].get("url")
+                if slave_url:
+                    tasks.append(
+                        client.post(f"{slave_url}/api/jobs/{job_id}/cancel")
+                    )
+        
+        if tasks:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception:
+                pass  # Ignore errors - slaves may be unreachable
 
 
 @app.put("/api/jobs/{job_id}/rename")

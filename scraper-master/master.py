@@ -550,11 +550,29 @@ WantedBy=multi-user.target
         except Exception as he:
             log(f"⚠ Health check failed (slave may still be starting): {str(he)[:60]}")
 
-        # 8. Mark as ready
+        # 8. Mark as ready in memory
         slaves[sid]["status"] = "idle"
         slaves[sid]["provision_progress"] = "done"
         slaves[sid]["last_seen"] = datetime.now().isoformat()
         log("✅ Provisioning complete!")
+        
+        # 9. Register slave in database (run in async context from thread)
+        log("Registering slave in database...")
+        try:
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(db.register_slave(
+                sid,
+                slaves[sid]["url"],
+                slave_name,
+                ip
+            ))
+            loop.run_until_complete(db.update_slave(sid, status="idle"))
+            loop.close()
+            log("✓ Slave registered in database")
+        except Exception as db_err:
+            log(f"⚠ Database registration failed: {str(db_err)[:100]}")
 
     except paramiko.AuthenticationException:
         log("✗ Authentication failed — check user/password")

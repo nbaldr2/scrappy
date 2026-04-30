@@ -60,10 +60,14 @@
   <section class="section fade-in">
     <div class="section-header">
       <h2><span class="icon">📋</span> Scraping Jobs</h2>
-      <button class="btn btn-ghost btn-sm" onclick="refreshJobs()">↻ Refresh</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="text" id="jobSearch" placeholder="Search jobs..." class="form-input" style="width:200px;padding:6px 10px;font-size:0.85rem" onkeyup="if(event.key==='Enter')refreshJobs()">
+        <button class="btn btn-ghost btn-sm" onclick="refreshJobs()">↻ Refresh</button>
+      </div>
     </div>
     <div id="jobsEmpty" class="empty-state"><div class="icon">📭</div><div class="title">No jobs yet</div><div class="desc">Upload a domain list to create your first scraping job</div></div>
     <div id="jobsList"></div>
+    <div id="jobsPagination" style="display:none;justify-content:center;gap:8px;margin-top:16px;flex-wrap:wrap"></div>
   </section>
 
   <!-- Activity Log -->
@@ -118,9 +122,27 @@
   </div>
 </div>
 
+<!-- Rename Job Modal -->
+<div class="modal-overlay" id="renameModal">
+  <div class="modal">
+    <h3>✏️ Rename Job</h3>
+    <input type="hidden" id="renameJobId">
+    <div class="form-group"><label>Job Name</label><input type="text" class="form-input" id="renameJobName" placeholder="Enter new name"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeRenameModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveJobName()">Save</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-container" id="toasts"></div>
 
 <script>
+// State
+let currentPage = 1;
+let totalPages = 1;
+let totalJobs = 0;
+
 function toast(msg,type='info'){const c=document.getElementById('toasts'),t=document.createElement('div');t.className=`toast toast-${type}`;const icon={'success':'✅','error':'❌','info':'ℹ️'}[type]||'ℹ️';t.innerHTML=`${icon} ${msg}`;c.appendChild(t);setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),300)},4000)}
 function addLog(msg,cls='log-info'){const t=document.getElementById('logTerminal'),e=document.createElement('div');e.className='log-entry';e.innerHTML=`<span class="log-time">[${new Date().toLocaleTimeString()}]</span> <span class="${cls}">${msg}</span>`;t.appendChild(e);t.scrollTop=t.scrollHeight}
 function clearLogs(){document.getElementById('logTerminal').innerHTML=''}
@@ -214,10 +236,13 @@ uz.addEventListener('drop',e=>{e.preventDefault();uz.classList.remove('dragover'
 function handleUpload(input){if(input.files.length)handleUploadFile(input.files[0])}
 async function handleUploadFile(file){
   const fd=new FormData();fd.append('file',file);
+  // Use filename as default name
+  const defaultName=file.name.replace(/\.[^.]+$/,'');
+  fd.append('name',defaultName);
   try{const r=await fetch('/api/jobs/upload',{method:'POST',body:fd});const d=await r.json();
-    if(d.ok){toast(`Uploaded: ${d.domains_raw} domains`,'success');addLog(`Job ${d.job_id} created — ${d.domains_raw} raw domains`,'log-success');
+    if(d.ok){toast(`Uploaded: ${d.domains_raw} domains`,'success');addLog(`Job ${d.job_id} (${d.name}) created — ${d.domains_raw} raw domains`,'log-success');
       document.getElementById('uploadResult').style.display='block';
-      document.getElementById('uploadResult').innerHTML=`<div style="display:flex;align-items:center;gap:12px;padding:14px;background:var(--success-bg);border:1px solid rgba(16,185,129,0.2);border-radius:var(--radius-md)"><span style="font-size:1.4rem">✅</span><div><strong>${d.domains_raw.toLocaleString()} domains uploaded</strong><br><span style="font-size:0.82rem;color:var(--text-muted)">Job: ${d.job_id}</span></div><button class="btn btn-success btn-sm" style="margin-left:auto" onclick="openJobConfig('${d.job_id}')">🚀 Launch</button></div>`;
+      document.getElementById('uploadResult').innerHTML=`<div style="display:flex;align-items:center;gap:12px;padding:14px;background:var(--success-bg);border:1px solid rgba(16,185,129,0.2);border-radius:var(--radius-md)"><span style="font-size:1.4rem">✅</span><div><strong>${d.domains_raw.toLocaleString()} domains uploaded</strong><br><span style="font-size:0.82rem;color:var(--text-muted)">Job: ${d.name} (${d.job_id})</span></div><button class="btn btn-success btn-sm" style="margin-left:auto" onclick="openJobConfig('${d.job_id}')">🚀 Launch</button></div>`;
       refreshJobs()}}catch(e){toast('Upload failed','error')}
 }
 
@@ -234,31 +259,64 @@ async function launchJob(){
   catch(e){toast('Failed','error')}
 }
 
+// ── Cancel Job ──
+async function cancelJob(id){if(!confirm('Cancel this job?'))return;try{const r=await fetch(`/api/jobs/${id}/cancel`,{method:'POST'});const d=await r.json();if(d.ok){toast('Job cancelled','info');addLog(`Job ${id} cancelled`,'log-info');refreshJobs()}}catch(e){toast('Cancel failed','error')}}
+
+// ── Rename Job ──
+function openRenameModal(id,name){document.getElementById('renameJobId').value=id;document.getElementById('renameJobName').value=name||'';document.getElementById('renameModal').classList.add('active')}
+function closeRenameModal(){document.getElementById('renameModal').classList.remove('active')}
+async function saveJobName(){const id=document.getElementById('renameJobId').value;const name=document.getElementById('renameJobName').value.trim();if(!name){toast('Name is required','error');return}try{const r=await fetch(`/api/jobs/${id}/rename`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});const d=await r.json();if(d.ok){toast('Job renamed','success');closeRenameModal();refreshJobs()}}catch(e){toast('Rename failed','error')}}
+
 // ── Jobs ──
 async function refreshJobs(){
-  try{const r=await fetch('/api/jobs');const jobs=await r.json();
-    document.getElementById('statJobs').textContent=jobs.length;
+  const search=document.getElementById('jobSearch').value.trim();
+  try{const r=await fetch(`/api/jobs?search=${encodeURIComponent(search)}&page=${currentPage}&limit=10`);const data=await r.json();
+    const jobs=data.jobs||[];
+    totalJobs=data.total||0;totalPages=data.total_pages||1;
+    document.getElementById('statJobs').textContent=totalJobs;
     let td=0,te=0;jobs.forEach(j=>{td+=j.domains_live||j.domains_cleaned||0;te+=j.emails_count||0});
     document.getElementById('statDomains').textContent=td.toLocaleString();document.getElementById('statEmails').textContent=te.toLocaleString();
-    if(!jobs.length){document.getElementById('jobsEmpty').style.display='';document.getElementById('jobsList').innerHTML='';return}
+    if(!jobs.length){document.getElementById('jobsEmpty').style.display='';document.getElementById('jobsList').innerHTML='';document.getElementById('jobsPagination').style.display='none';return}
     document.getElementById('jobsEmpty').style.display='none';
     document.getElementById('jobsList').innerHTML=jobs.map(j=>{
-      const isActive=['cleaning','dns_filtering','scraping','processing'].includes(j.status),isDone=j.status==='completed';
+      const isActive=['cleaning','dns_filtering','scraping','processing'].includes(j.status),isDone=j.status==='completed',isCancellable=isActive;
+      // DNS progress indicator
+      let dnsProgress='';
+      if(j.status==='dns_filtering'&&j.dns_progress){const p=j.dns_progress;dnsProgress=`<div style="margin-top:8px;font-size:0.78rem;color:var(--accent-primary)">🔍 DNS Check: ${p.checked.toLocaleString()}/${p.total.toLocaleString()} (${Math.round(p.checked/p.total*100)}%)</div>`}
       return`<div style="padding:20px;background:var(--bg-glass);border:1px solid var(--border-glass);border-radius:var(--radius-md);margin-bottom:12px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-          <div><strong>${esc(j.id)}</strong> <span class="badge badge-${j.status}">${j.status}</span>${isActive?'<span class="spinner" style="margin-left:8px"></span>':''}</div>
-          <div style="display:flex;gap:8px">${j.status==='uploaded'?`<button class="btn btn-success btn-sm" onclick="openJobConfig('${j.id}')">🚀 Launch</button>`:''}${isDone&&j.emails_count?`<a href="/api/jobs/${j.id}/download" class="btn btn-primary btn-sm">📥 Download (${j.emails_count})</a>`:''}</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <strong style="font-size:1rem">${esc(j.name||j.id)}</strong>
+            <span class="badge badge-${j.status}">${j.status}</span>
+            ${isActive?'<span class="spinner" style="margin-left:4px"></span>':''}
+          </div>
+          <div style="display:flex;gap:8px">
+            ${j.status==='uploaded'?`<button class="btn btn-success btn-sm" onclick="openJobConfig('${j.id}')">🚀 Launch</button>`:''}
+            ${isCancellable?`<button class="btn btn-danger btn-sm" onclick="cancelJob('${j.id}')">✕ Cancel</button>`:''}
+            ${isDone&&j.emails_count?`<a href="/api/jobs/${j.id}/download" class="btn btn-primary btn-sm">📥 Download (${j.emails_count})</a>`:''}
+            <button class="btn btn-ghost btn-sm" onclick="openRenameModal('${j.id}','${esc(j.name||'')}')" title="Rename">✏️</button>
+          </div>
         </div>
+        <div style="font-size:0.78rem;color:var(--text-muted);margin-bottom:8px">ID: ${j.id} • Created: ${j.created_at?new Date(j.created_at).toLocaleString():'—'}</div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;font-size:0.82rem;color:var(--text-secondary)">
           <div>📥 Raw: <strong style="color:var(--text-primary)">${(j.domains_raw||0).toLocaleString()}</strong></div>
           <div>🧹 Cleaned: <strong style="color:var(--text-primary)">${(j.domains_cleaned||0).toLocaleString()}</strong></div>
           <div>✅ Live: <strong style="color:var(--success)">${(j.domains_live||0).toLocaleString()}</strong></div>
           <div>📧 Emails: <strong style="color:var(--accent-primary)">${(j.emails_count||0).toLocaleString()}</strong></div>
         </div>
+        ${dnsProgress}
         ${j.error?`<div style="margin-top:10px;padding:8px 12px;background:var(--danger-bg);border-radius:var(--radius-sm);font-size:0.8rem;color:var(--danger)">⚠ ${esc(j.error)}</div>`:''}
-        ${j.clean_stats&&j.clean_stats.original?`<div style="margin-top:10px;font-size:0.78rem;color:var(--text-muted)">Cleaning: ${j.clean_stats.original}→${j.clean_stats.final} (${j.clean_stats.removed} removed)${j.dns_stats&&j.dns_stats.alive?` · DNS: ${j.dns_stats.alive} alive, ${j.dns_stats.dead} dead`:''}</div>`:''}</div>`}).join('')}catch{}
+        ${j.clean_stats&&j.clean_stats.original?`<div style="margin-top:10px;font-size:0.78rem;color:var(--text-muted)">Cleaning: ${j.clean_stats.original}→${j.clean_stats.final} (${j.clean_stats.removed} removed)${j.dns_stats&&j.dns_stats.alive?` · DNS: ${j.dns_stats.alive} alive, ${j.dns_stats.dead} dead`:''}</div>`:''}
+      </div>`}).join('');
+    // Pagination
+    const pagEl=document.getElementById('jobsPagination');
+    if(totalPages>1){pagEl.style.display='flex';pagEl.innerHTML=Array.from({length:totalPages},(_,i)=>i+1).map(p=>`<button class="btn ${p===currentPage?'btn-primary':'btn-ghost'} btn-sm" onclick="goToPage(${p})">${p}</button>`).join('')}else{pagEl.style.display='none'}}
+  catch{}
 }
 
+function goToPage(p){currentPage=p;refreshJobs()}
+
+// Initialize
 refreshSlaves();refreshJobs();setInterval(()=>{refreshSlaves();refreshJobs()},5000);
 </script>
 </body>

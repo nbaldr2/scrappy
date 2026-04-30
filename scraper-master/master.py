@@ -19,10 +19,17 @@ from typing import Optional
 
 import httpx
 import paramiko
-from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+# Try to use aiodns for async DNS resolution (much faster)
+try:
+    import aiodns
+    HAS_AIODNS = True
+except ImportError:
+    HAS_AIODNS = False
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).parent
@@ -141,11 +148,29 @@ def clean_domains(raw_lines: list[str], phase2: bool = True) -> tuple[list[str],
     return cleaned, stats
 
 
-# ── DNS Pre-Filter ─────────────────────────────────────────────────────────────
+# ── DNS Pre-Filter (High-Performance Async) ────────────────────────────────────
 
 DNS_TIMEOUT = 2
+DNS_MAX_WORKERS = 500  # Increased from 150 for much faster processing
 
-def _dns_check(host: str) -> bool:
+# Global cancellation flags for jobs
+job_cancel_flags: dict[str, bool] = {}
+
+async def _dns_check_async(host: str, resolver=None) -> bool:
+    """Async DNS check using aiodns if available, otherwise fallback to socket."""
+    if HAS_AIODNS and resolver:
+        try:
+            await asyncio.wait_for(resolver.query(host, 'A'), timeout=DNS_TIMEOUT)
+            return True
+        except Exception:
+            return False
+    else:
+        # Fallback to sync socket in thread
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _dns_check_sync, host)
+
+def _dns_check_sync(host: str) -> bool:
+    """Synchronous DNS check using socket."""
     orig = socket.getdefaulttimeout()
     try:
         socket.setdefaulttimeout(DNS_TIMEOUT)
@@ -156,22 +181,82 @@ def _dns_check(host: str) -> bool:
     finally:
         socket.setdefaulttimeout(orig)
 
+async def dns_filter_async(domains: list[str], job_id: str = None) -> tuple[list[str], int]:
+    """
+    High-performance async DNS filter with progress tracking and cancellation support.
+    Uses aiodns for much faster resolution when available.
+    """
+    global job_cancel_flags
+    
+    live, dead = [], 0
+    total = len(domains)
+    checked = 0
+    
+    # Check if job was cancelled
+    if job_id and job_cancel_flags.get(job_id, False):
+        return [], 0
+    
+    # Create aiodns resolver if available (much faster)
+    resolver = None
+    if HAS_AIODNS:
+        try:
+            resolver = aiodns.DNSResolver()
+        except Exception:
+            resolver = None
+    
+    # Process in batches with progress updates
+    batch_size = 100  # Update progress every 100 domains
+    semaphore = asyncio.Semaphore(DNS_MAX_WORKERS)
+    
+    async def check_one(domain: str) -> tuple[bool, str]:
+        nonlocal checked
+        async with semaphore:
+            # Check for cancellation
+            if job_id and job_cancel_flags.get(job_id, False):
+                return False, domain
+            result = await _dns_check_async(domain, resolver)
+            checked += 1
+            # Update job progress periodically
+            if job_id and checked % batch_size == 0 and job_id in jobs:
+                jobs[job_id]["dns_progress"] = {"checked": checked, "total": total, "live": len(live)}
+            return result, domain
+    
+    # Run all checks concurrently with semaphore limiting
+    tasks = [check_one(d) for d in domains]
+    
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if job_id and job_cancel_flags.get(job_id, False):
+                # Job cancelled
+                return live, dead
+            if isinstance(result, Exception):
+                dead += 1
+            elif isinstance(result, tuple):
+                is_live, domain = result
+                if is_live:
+                    live.append(domain)
+                else:
+                    dead += 1
+            else:
+                dead += 1
+    except Exception as e:
+        pass
+    
+    return live, dead
 
-def dns_filter_sync(domains: list[str], max_workers: int = 150) -> tuple[list[str], int]:
+
+def dns_filter_sync(domains: list[str], max_workers: int = DNS_MAX_WORKERS) -> tuple[list[str], int]:
+    """Synchronous wrapper for DNS filter (used as fallback)."""
     live, dead = [], 0
     with ThreadPoolExecutor(max_workers=min(max_workers, len(domains) or 1)) as ex:
-        futures = {ex.submit(_dns_check, d): d for d in domains}
+        futures = {ex.submit(_dns_check_sync, d): d for d in domains}
         for fut in futures:
             if fut.result():
                 live.append(futures[fut])
             else:
                 dead += 1
     return live, dead
-
-
-async def dns_filter_async(domains: list[str]) -> tuple[list[str], int]:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, dns_filter_sync, domains)
 
 
 # ── SSH Auto-Provisioning ─────────────────────────────────────────────────────
@@ -471,15 +556,21 @@ async def slave_heartbeat(slave_id: str, data: dict):
 # ── Job Orchestration ──────────────────────────────────────────────────────────
 
 @app.post("/api/jobs/upload")
-async def upload_domains(file: UploadFile = File(...)):
+async def upload_domains(file: UploadFile = File(...), name: str = Form(None)):
     """Upload domain list — stored for processing."""
     content = (await file.read()).decode("utf-8", errors="ignore")
     lines = content.strip().splitlines()
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:6]
     fpath = UPLOAD_DIR / f"{job_id}.txt"
     fpath.write_text(content, encoding="utf-8")
+    
+    # Generate name from filename if not provided
+    if not name:
+        name = file.filename.rsplit('.', 1)[0] if file.filename else f"Job {job_id[:13]}"
+    
     jobs[job_id] = {
         "id": job_id,
+        "name": name,
         "status": "uploaded",
         "file": str(fpath),
         "domains_raw": len([l for l in lines if l.strip() and not l.startswith('#')]),
@@ -493,9 +584,10 @@ async def upload_domains(file: UploadFile = File(...)):
         "finished_at": None,
         "clean_stats": {},
         "dns_stats": {},
+        "dns_progress": None,
         "error": None,
     }
-    return {"ok": True, "job_id": job_id, "domains_raw": jobs[job_id]["domains_raw"]}
+    return {"ok": True, "job_id": job_id, "name": name, "domains_raw": jobs[job_id]["domains_raw"]}
 
 
 @app.post("/api/jobs/{job_id}/start")
@@ -536,7 +628,7 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool):
         # 3. DNS filter
         if dns_on and cleaned:
             job["status"] = "dns_filtering"
-            live, dead = await dns_filter_async(cleaned)
+            live, dead = await dns_filter_async(cleaned, job_id)  # Pass job_id for cancellation support
             job["domains_live"] = len(live)
             job["dns_stats"] = {"alive": len(live), "dead": dead}
         else:
@@ -681,11 +773,37 @@ async def download_emails(job_id: str):
 # ── API: Jobs listing ──────────────────────────────────────────────────────────
 
 @app.get("/api/jobs")
-async def list_jobs():
-    return [
+async def list_jobs(search: str = None, page: int = 1, limit: int = 50):
+    """List jobs with search and pagination. Returns most recent first."""
+    all_jobs = [
         {k: v for k, v in j.items() if k != "emails"}
         for j in jobs.values()
     ]
+    
+    # Filter by search term
+    if search:
+        search_lower = search.lower()
+        all_jobs = [j for j in all_jobs if 
+                    search_lower in j.get("name", "").lower() or
+                    search_lower in j.get("id", "").lower() or
+                    search_lower in j.get("status", "").lower()]
+    
+    # Sort by created_at descending (most recent first)
+    all_jobs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    
+    # Pagination
+    total = len(all_jobs)
+    start = (page - 1) * limit
+    end = start + limit
+    paginated = all_jobs[start:end]
+    
+    return {
+        "jobs": paginated,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": (total + limit - 1) // limit
+    }
 
 
 @app.get("/api/jobs/{job_id}")
@@ -696,6 +814,40 @@ async def get_job(job_id: str):
     j["emails_preview"] = j["emails"][:20]
     j["emails"] = None
     return j
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Cancel a running job."""
+    global job_cancel_flags
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    
+    job = jobs[job_id]
+    if job["status"] in ("completed", "failed", "cancelled"):
+        raise HTTPException(400, f"Cannot cancel job with status: {job['status']}")
+    
+    # Set cancellation flag
+    job_cancel_flags[job_id] = True
+    job["status"] = "cancelled"
+    job["finished_at"] = datetime.now().isoformat()
+    job["error"] = "Job cancelled by user"
+    
+    return {"ok": True, "status": "cancelled"}
+
+
+@app.put("/api/jobs/{job_id}/rename")
+async def rename_job(job_id: str, data: dict):
+    """Rename a job."""
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    
+    new_name = data.get("name", "").strip()
+    if not new_name:
+        raise HTTPException(400, "Name is required")
+    
+    jobs[job_id]["name"] = new_name
+    return {"ok": True, "name": new_name}
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────

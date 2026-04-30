@@ -1,6 +1,7 @@
 """
 Scraper Master — FastAPI server with dashboard, domain cleaning, DNS filtering,
 SSH auto-provisioning, slave monitoring/heartbeat, and email collection.
+Uses PostgreSQL for persistent storage.
 """
 
 import asyncio
@@ -16,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from contextlib import asynccontextmanager
 
 import httpx
 import paramiko
@@ -23,6 +25,9 @@ from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException, Que
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+# Database
+import database as db
 
 # Try to use aiodns for async DNS resolution (much faster)
 try:
@@ -39,59 +44,26 @@ SLAVE_DIR   = BASE_DIR.parent / "scraper-slave"
 UPLOAD_DIR.mkdir(exist_ok=True)
 RESULT_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Scraper Master", version="2.0.0")
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-
-# ── In-memory state ────────────────────────────────────────────────────────────
-
-# Slave registry:  {slave_id: {url, name, status, last_seen, ...}}
-slaves: dict[str, dict] = {}
-
-# Jobs:  {job_id: {status, domains_total, domains_cleaned, domains_live,
-#                  domains_per_slave, progress, emails, ...}}
-jobs: dict[str, dict] = {}
-
-# Provisioning logs:  {slave_id: [log_lines]}
+# ── Provisioning logs:  {slave_id: [log_lines]} ────────────────────────────────
 provision_logs: dict[str, list] = {}
 
-# ── Persistence ───────────────────────────────────────────────────────────────
+# ── Lifespan ───────────────────────────────────────────────────────────────────
 
-STATE_FILE = BASE_DIR / "state.json"
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan - startup and shutdown events."""
+    # Startup
+    print("Initializing database...")
+    await db.init_database()
+    print("Database connected and tables created")
+    yield
+    # Shutdown
+    print("Closing database connection...")
+    await db.close_database()
 
-def save_state():
-    """Persist jobs and slaves to JSON file."""
-    try:
-        state = {
-            "jobs": {k: v for k, v in jobs.items()},
-            "slaves": {k: v for k, v in slaves.items()},
-        }
-        STATE_FILE.write_text(json.dumps(state, default=str), encoding="utf-8")
-    except Exception as e:
-        print(f"Warning: Failed to save state: {e}")
-
-def load_state():
-    """Load jobs and slaves from JSON file on startup."""
-    global jobs, slaves
-    try:
-        if STATE_FILE.exists():
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            # Load slaves
-            for sid, s in state.get("slaves", {}).items():
-                slaves[sid] = s
-                # Reset status for slaves that were active before restart
-                if s.get("status") in ("scraping", "processing"):
-                    slaves[sid]["status"] = "idle"
-            # Load jobs
-            for jid, j in state.get("jobs", {}).items():
-                jobs[jid] = j
-                # Reset status for jobs that were active before restart
-                if j.get("status") in ("cleaning", "dns_filtering", "scraping", "processing"):
-                    jobs[jid]["status"] = "failed"
-                    jobs[jid]["error"] = "Job interrupted by server restart"
-            print(f"Loaded {len(slaves)} slaves and {len(jobs)} jobs from state file")
-    except Exception as e:
-        print(f"Warning: Failed to load state: {e}")
+app = FastAPI(title="Scraper Master", version="2.1.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 # ── Domain Cleaning (ported from pyscrap.py) ───────────────────────────────────
 
@@ -652,21 +624,15 @@ async def start_monitor():
 async def register_slave(data: dict):
     """Register a slave (manual registration or from provisioning)."""
     sid = data.get("id") or str(uuid.uuid4())[:8]
-    slaves[sid] = {
-        "id": sid,
-        "url": data["url"].rstrip("/"),
-        "name": data.get("name", f"Slave-{sid[:4]}"),
-        "ip": data.get("ip", ""),
-        "status": "idle",
-        "last_seen": datetime.now().isoformat(),
-        "domains_assigned": 0,
-        "domains_done": 0,
-        "emails_found": 0,
-        "system_stats": {},
-        "provision_progress": "manual",
-    }
-    save_state()
-    return {"ok": True, "slave_id": sid}
+    url = data.get("url", "").strip()
+    name = data.get("name", f"Slave {sid}").strip()
+    ip = data.get("ip", "").strip()
+    
+    if not url:
+        raise HTTPException(400, "URL is required")
+    
+    slave = await db.register_slave(sid, url, name, ip)
+    return {"ok": True, "slave_id": sid, "slave": slave}
 
 
 @app.post("/api/slaves/provision")
@@ -722,63 +688,57 @@ async def get_provision_logs(slave_id: str):
 
 @app.delete("/api/slaves/{slave_id}")
 async def remove_slave(slave_id: str):
-    if slave_id in slaves:
-        del slaves[slave_id]
-        provision_logs.pop(slave_id, None)
-        save_state()
+    deleted = await db.delete_slave(slave_id)
+    if deleted:
         return {"ok": True}
     raise HTTPException(404, "Slave not found")
 
 
 @app.get("/api/slaves")
-async def list_slaves():
-    return list(slaves.values())
+async def list_slaves_endpoint():
+    slaves = await db.list_slaves()
+    return slaves
 
 
 @app.put("/api/slaves/{slave_id}")
-async def update_slave(slave_id: str, data: dict):
+async def update_slave_endpoint(slave_id: str, data: dict):
     """Update slave settings (name)."""
-    if slave_id not in slaves:
+    slave = await db.get_slave(slave_id)
+    if not slave:
         raise HTTPException(404, "Slave not found")
     
-    if "name" in data:
-        slaves[slave_id]["name"] = data["name"].strip()
-    save_state()
-    return {"ok": True, "slave": slaves[slave_id]}
+    name = data.get("name", "").strip()
+    if name:
+        await db.update_slave(slave_id, name=name)
+    
+    updated = await db.get_slave(slave_id)
+    return {"ok": True, "slave": updated}
 
 
 @app.post("/api/slaves/{slave_id}/reboot")
 async def reboot_slave(slave_id: str):
     """Reboot the slave VPS."""
-    if slave_id not in slaves:
+    slave = await db.get_slave(slave_id)
+    if not slave:
         raise HTTPException(404, "Slave not found")
     
-    slave = slaves[slave_id]
     slave_url = slave.get("url", "")
-    slave_ip = slave.get("ip", "")
+    ip = slave.get("ip", "")
     
-    # Try to trigger reboot via SSH or API
+    # Try system reboot endpoint first
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Try to call reboot endpoint on slave
             r = await client.post(f"{slave_url}/api/system/reboot")
             if r.status_code == 200:
-                slave["status"] = "offline"
+                await db.update_slave(slave_id, status="rebooting")
                 return {"ok": True, "message": "Reboot initiated"}
     except Exception:
         pass
     
-    # If we have IP, try SSH reboot
-    if slave_ip:
-        try:
-            import paramiko
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            # This would require stored credentials - for now just mark status
-            slave["status"] = "offline"
-            return {"ok": True, "message": "Manual reboot required - SSH credentials not stored"}
-        except Exception:
-            pass
+    # Fallback: Manual reboot required
+    if ip:
+        await db.update_slave(slave_id, status="offline")
+        return {"ok": True, "message": "Manual reboot required - SSH credentials not stored"}
     
     return {"ok": False, "message": "Could not reboot slave"}
 
@@ -786,10 +746,10 @@ async def reboot_slave(slave_id: str):
 @app.post("/api/slaves/{slave_id}/restart-service")
 async def restart_slave_service(slave_id: str):
     """Restart the scraper-slave service (clears memory)."""
-    if slave_id not in slaves:
+    slave = await db.get_slave(slave_id)
+    if not slave:
         raise HTTPException(404, "Slave not found")
     
-    slave = slaves[slave_id]
     slave_url = slave.get("url", "")
     
     try:
@@ -806,39 +766,28 @@ async def restart_slave_service(slave_id: str):
 @app.get("/api/slaves/{slave_id}/jobs")
 async def get_slave_jobs(slave_id: str):
     """Get jobs assigned to this slave."""
-    if slave_id not in slaves:
+    slave = await db.get_slave(slave_id)
+    if not slave:
         raise HTTPException(404, "Slave not found")
     
-    assigned_jobs = []
-    for jid, job in jobs.items():
-        if slave_id in job.get("domains_per_slave", {}):
-            assigned_jobs.append({
-                "id": jid,
-                "name": job.get("name", jid),
-                "status": job["status"],
-                "domains_assigned": job["domains_per_slave"].get(slave_id, 0),
-                "emails_found": slaves[slave_id].get("emails_found", 0),
-                "domains_done": slaves[slave_id].get("domains_done", 0)
-            })
-    
-    return {"jobs": assigned_jobs}
+    assignments = await db.get_job_assignments_for_slave(slave_id)
+    return {"jobs": assignments}
 
 
 @app.post("/api/slaves/{slave_id}/pause")
 async def pause_slave(slave_id: str):
     """Pause all jobs on a slave."""
-    if slave_id not in slaves:
+    slave = await db.get_slave(slave_id)
+    if not slave:
         raise HTTPException(404, "Slave not found")
     
-    slave = slaves[slave_id]
     slave_url = slave.get("url", "")
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(f"{slave_url}/api/system/pause")
             if r.status_code == 200:
-                slave["status"] = "paused"
-                save_state()
+                await db.update_slave(slave_id, status="paused")
                 return {"ok": True, "message": "Slave paused"}
     except Exception as e:
         return {"ok": False, "message": f"Failed: {str(e)[:50]}"}
@@ -849,18 +798,17 @@ async def pause_slave(slave_id: str):
 @app.post("/api/slaves/{slave_id}/resume")
 async def resume_slave(slave_id: str):
     """Resume all jobs on a slave."""
-    if slave_id not in slaves:
+    slave = await db.get_slave(slave_id)
+    if not slave:
         raise HTTPException(404, "Slave not found")
     
-    slave = slaves[slave_id]
     slave_url = slave.get("url", "")
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(f"{slave_url}/api/system/resume")
             if r.status_code == 200:
-                slave["status"] = "idle"
-                save_state()
+                await db.update_slave(slave_id, status="idle")
                 return {"ok": True, "message": "Slave resumed"}
     except Exception as e:
         return {"ok": False, "message": f"Failed: {str(e)[:50]}"}
@@ -871,15 +819,22 @@ async def resume_slave(slave_id: str):
 @app.post("/api/slaves/{slave_id}/heartbeat")
 async def slave_heartbeat(slave_id: str, data: dict):
     """Slave calls this periodically to report progress + system metrics."""
-    if slave_id not in slaves:
+    slave = await db.get_slave(slave_id)
+    if not slave:
         raise HTTPException(404, "Unknown slave")
-    s = slaves[slave_id]
-    s["last_seen"] = datetime.now().isoformat()
-    s["status"] = data.get("status", s["status"])
-    s["domains_done"] = data.get("domains_done", s["domains_done"])
-    s["emails_found"] = data.get("emails_found", s["emails_found"])
-    if "system_stats" in data:
-        s["system_stats"] = data["system_stats"]
+    
+    # Update slave status
+    update_fields = {
+        "last_seen": datetime.now().isoformat(),
+        "status": data.get("status", slave.get("status", "idle")),
+        "domains_done": data.get("domains_done", slave.get("domains_done", 0)),
+        "emails_found": data.get("emails_found", slave.get("emails_found", 0)),
+    }
+    
+    if data.get("system_stats"):
+        update_fields["system_stats"] = data.get("system_stats")
+    
+    await db.update_slave(slave_id, **update_fields)
     return {"ok": True}
 
 
@@ -898,101 +853,97 @@ async def upload_domains(file: UploadFile = File(...), name: str = Form(None)):
     if not name:
         name = file.filename.rsplit('.', 1)[0] if file.filename else f"Job {job_id[:13]}"
     
-    jobs[job_id] = {
-        "id": job_id,
-        "name": name,
-        "status": "uploaded",
-        "file": str(fpath),
-        "domains_raw": len([l for l in lines if l.strip() and not l.startswith('#')]),
-        "domains_cleaned": 0,
-        "domains_live": 0,
-        "domains_per_slave": {},
-        "emails": [],
-        "emails_count": 0,
-        "created_at": datetime.now().isoformat(),
-        "started_at": None,
-        "finished_at": None,
-        "clean_stats": {},
-        "dns_stats": {},
-        "dns_progress": None,
-        "error": None,
-    }
-    save_state()
-    return {"ok": True, "job_id": job_id, "name": name, "domains_raw": jobs[job_id]["domains_raw"]}
+    # Create job in database
+    domains_raw = len([l for l in lines if l.strip() and not l.startswith('#')])
+    await db.create_job(job_id, name, str(fpath))
+    await db.update_job(job_id, domains_total=domains_raw)
+    
+    return {"ok": True, "job_id": job_id, "name": name, "domains_raw": domains_raw}
 
 
 @app.post("/api/jobs/{job_id}/start")
 async def start_job(job_id: str, workers: int = 12, turbo: bool = True,
                     dns_on: bool = True):
     """Clean, DNS filter, split and dispatch to slaves."""
-    if job_id not in jobs:
+    job = await db.get_job(job_id)
+    if not job:
         raise HTTPException(404, "Job not found")
-    job = jobs[job_id]
+    
     if job["status"] not in ("uploaded", "failed"):
         raise HTTPException(400, f"Job is {job['status']}")
 
-    active_slaves = {k: v for k, v in slaves.items()
-                     if v["status"] not in ("dead", "offline", "provisioning", "error")}
+    # Get active slaves from database
+    active_slaves = await db.list_slaves()
+    active_slaves = {s["id"]: s for s in active_slaves 
+                     if s.get("status") not in ("dead", "offline", "provisioning", "error")}
+    
     if not active_slaves:
         raise HTTPException(400, "No active slaves available — provision or check connections")
 
-    job["status"] = "processing"
-    job["started_at"] = datetime.now().isoformat()
-    job["error"] = None
+    await db.update_job(job_id, status="processing", started_at=datetime.now().isoformat(), error=None)
 
     asyncio.create_task(_run_job(job_id, workers, turbo, dns_on))
     return {"ok": True, "status": "processing"}
 
 
 async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool):
-    job = jobs[job_id]
+    job = await db.get_job(job_id)
+    if not job:
+        return
+    
     try:
         # 1. Load raw domains
-        raw_lines = Path(job["file"]).read_text(encoding="utf-8").splitlines()
+        raw_lines = Path(job["file_path"]).read_text(encoding="utf-8").splitlines()
 
         # 2. Clean
-        job["status"] = "cleaning"
+        await db.update_job(job_id, status="cleaning")
         cleaned, cstats = clean_domains(raw_lines, phase2=True)
-        job["domains_cleaned"] = len(cleaned)
-        job["clean_stats"] = cstats
+        await db.update_job(job_id, domains_cleaned=len(cleaned), clean_stats=cstats)
 
         # 3. DNS filter
+        live = cleaned
         if dns_on and cleaned:
-            job["status"] = "dns_filtering"
-            live, dead = await dns_filter_async(cleaned, job_id)  # Pass job_id for cancellation support
-            job["domains_live"] = len(live)
-            job["dns_stats"] = {"alive": len(live), "dead": dead}
+            await db.update_job(job_id, status="dns_filtering")
+            live, dead = await dns_filter_async(cleaned, job_id)
+            await db.update_job(job_id, domains_live=len(live), dns_stats={"alive": len(live), "dead": dead})
         else:
-            live = cleaned
-            job["domains_live"] = len(live)
+            await db.update_job(job_id, domains_live=len(live))
 
         if not live:
-            job["status"] = "completed"
-            job["finished_at"] = datetime.now().isoformat()
+            await db.update_job(job_id, status="completed", finished_at=datetime.now().isoformat())
             return
 
         # 4. Split across active slaves
-        active = {k: v for k, v in slaves.items()
-                  if v["status"] not in ("dead", "offline", "provisioning", "error")}
+        slaves_list = await db.list_slaves()
+        active = {s["id"]: s for s in slaves_list
+                  if s.get("status") not in ("dead", "offline", "provisioning", "error")}
         slave_ids = list(active.keys())
+        
+        if not slave_ids:
+            await db.update_job(job_id, status="failed", error="No active slaves available")
+            return
+        
         n = len(slave_ids)
         chunk_size = len(live) // n
         remainder = len(live) % n
 
         chunks = {}
+        domains_per_slave = {}
         idx = 0
         for i, sid in enumerate(slave_ids):
             size = chunk_size + (1 if i < remainder else 0)
             chunks[sid] = live[idx:idx+size]
             idx += size
-            job["domains_per_slave"][sid] = len(chunks[sid])
-            active[sid]["domains_assigned"] = len(chunks[sid])
-            active[sid]["domains_done"] = 0
-            active[sid]["emails_found"] = 0
-            active[sid]["status"] = "scraping"
+            domains_per_slave[sid] = len(chunks[sid])
+            # Create assignment
+            await db.assign_job_to_slave(job_id, sid, len(chunks[sid]))
+            # Update slave status
+            await db.update_slave(sid, status="scraping", domains_assigned=len(chunks[sid]), 
+                                  domains_done=0, emails_found=0)
+
+        await db.update_job(job_id, status="scraping", domains_per_slave=domains_per_slave)
 
         # 5. Dispatch to slaves
-        job["status"] = "scraping"
         async with httpx.AsyncClient(timeout=30.0) as client:
             tasks = []
             for sid, chunk in chunks.items():
@@ -1010,28 +961,40 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool):
             for i, r in enumerate(results):
                 sid = slave_ids[i]
                 if isinstance(r, Exception):
-                    slaves[sid]["status"] = "error"
-                    job["error"] = f"Slave {sid}: {str(r)[:100]}"
+                    await db.update_slave(sid, status="error")
+                    await db.update_job(job_id, error=f"Slave {sid}: {str(r)[:100]}")
 
         # 6. Poll slaves until done
         await _poll_until_done(job_id)
 
     except Exception as e:
-        job["status"] = "failed"
-        job["error"] = str(e)
+        await db.update_job(job_id, status="failed", error=str(e)[:500])
+        await db.log_activity("error", "jobs", f"Job {job_id} failed: {str(e)[:100]}", {"job_id": job_id})
 
 
 async def _poll_until_done(job_id: str):
     """Poll slave progress until all done with progress tracking."""
     global job_cancel_flags
     
-    job = jobs[job_id]
-    active = {k: v for k, v in slaves.items()
-              if k in job["domains_per_slave"]}
+    job = await db.get_job(job_id)
+    if not job:
+        return
+    
+    # Get assigned slaves
+    assignments = await db.get_job_assignments(job_id)
+    active_slaves = {a["slave_id"]: a for a in assignments}
+    slave_ids = list(active_slaves.keys())
+    
+    # Get slave URLs
+    slaves_data = {}
+    for sid in slave_ids:
+        slave = await db.get_slave(sid)
+        if slave:
+            slaves_data[sid] = slave
     
     # Track progress
-    total_domains = sum(job["domains_per_slave"].values())
-    job["progress"] = {"percent": 0, "elapsed_seconds": 0, "estimated_seconds": 0, "rate": 0}
+    domains_per_slave = job.get("domains_per_slave") or {}
+    total_domains = sum(domains_per_slave.values()) if isinstance(domains_per_slave, dict) else 0
     start_time = datetime.now()
     
     while True:
@@ -1039,8 +1002,7 @@ async def _poll_until_done(job_id: str):
         
         # Check if job was cancelled
         if job_cancel_flags.get(job_id, False) or job.get("status") == "cancelled":
-            job["status"] = "cancelled"
-            save_state()
+            await db.update_job(job_id, status="cancelled")
             return
         
         all_done = True
@@ -1049,14 +1011,31 @@ async def _poll_until_done(job_id: str):
         any_scraping = False
 
         async with httpx.AsyncClient(timeout=15.0) as client:
-            for sid, sinfo in active.items():
+            for sid in slave_ids:
+                sinfo = slaves_data.get(sid, {})
+                url = sinfo.get("url", "")
+                if not url:
+                    continue
+                    
                 try:
-                    r = await client.get(f"{sinfo['url']}/api/status/{job_id}")
+                    r = await client.get(f"{url}/api/status/{job_id}")
                     data = r.json()
-                    sinfo["status"] = data.get("status", "unknown")
-                    sinfo["domains_done"] = data.get("domains_done", 0)
-                    sinfo["emails_found"] = data.get("emails_found", 0)
-                    sinfo["last_seen"] = datetime.now().isoformat()
+                    
+                    # Update slave status in database
+                    await db.update_slave(sid, 
+                        status=data.get("status", "unknown"),
+                        domains_done=data.get("domains_done", 0),
+                        emails_found=data.get("emails_found", 0),
+                        last_seen=datetime.now().isoformat()
+                    )
+                    
+                    # Update assignment
+                    await db.update_assignment(job_id, sid,
+                        domains_done=data.get("domains_done", 0),
+                        emails_found=data.get("emails_found", 0),
+                        status=data.get("status", "unknown")
+                    )
+                    
                     total_done += data.get("domains_done", 0)
 
                     status = data.get("status", "unknown")
@@ -1066,21 +1045,27 @@ async def _poll_until_done(job_id: str):
                         any_scraping = True
                     if data.get("emails"):
                         total_emails.extend(data["emails"])
+                        # Save emails to database
+                        await db.save_emails(job_id, data["emails"])
                 except Exception:
                     all_done = False
 
-        unique = list(set(total_emails))
-        job["emails"] = unique
-        job["emails_count"] = len(unique)
+        # Get unique email count from database
+        email_count_result = await db.db.fetch_one(
+            "SELECT COUNT(*) FROM emails WHERE job_id = :job_id",
+            {"job_id": job_id}
+        )
+        total_emails_count = email_count_result[0] if email_count_result else 0
         
         # Calculate progress
         elapsed = (datetime.now() - start_time).total_seconds()
+        progress = None
         if total_domains > 0 and total_done > 0:
             percent = min(100, (total_done / total_domains) * 100)
             rate = total_done / elapsed if elapsed > 0 else 0
             remaining = total_domains - total_done
             estimated = remaining / rate if rate > 0 else 0
-            job["progress"] = {
+            progress = {
                 "percent": round(percent, 1),
                 "elapsed_seconds": round(elapsed),
                 "estimated_seconds": round(estimated),
@@ -1088,20 +1073,22 @@ async def _poll_until_done(job_id: str):
                 "domains_done": total_done,
                 "domains_total": total_domains
             }
-        
-        save_state()  # Save progress periodically
+            await db.update_job(job_id, domains_done=total_done, progress=progress)
 
         # If all slaves report done/cancelled/failed, exit
         if all_done and not any_scraping:
             break
 
     # Only mark as completed if not cancelled
-    if job.get("status") != "cancelled":
-        job["status"] = "completed"
-    job["finished_at"] = datetime.now().isoformat()
-
+    job_status = job.get("status")
+    if job_status != "cancelled":
+        await db.update_job(job_id, status="completed")
+    await db.update_job(job_id, finished_at=datetime.now().isoformat())
+    
+    # Save final emails to file
+    emails = await db.get_emails(job_id)
     result_file = RESULT_DIR / f"{job_id}_emails.txt"
-    result_file.write_text("\n".join(sorted(set(job["emails"]))), encoding="utf-8")
+    result_file.write_text("\n".join(sorted(emails)), encoding="utf-8")
 
 
 # ── Slave email collection endpoint ───────────────────────────────────────────
@@ -1109,23 +1096,32 @@ async def _poll_until_done(job_id: str):
 @app.post("/api/jobs/{job_id}/emails")
 async def collect_emails(job_id: str, data: dict):
     """Slave POSTs scraped emails here."""
-    if job_id not in jobs:
+    job = await db.get_job(job_id)
+    if not job:
         raise HTTPException(404, "Job not found")
+    
     new_emails = data.get("emails", [])
     slave_id = data.get("slave_id", "unknown")
-    job = jobs[job_id]
-    existing = set(job["emails"])
-    existing.update(new_emails)
-    job["emails"] = list(existing)
-    job["emails_count"] = len(existing)
-
-    if slave_id in slaves:
-        slaves[slave_id]["emails_found"] = data.get("total_emails", len(new_emails))
-        slaves[slave_id]["domains_done"] = data.get("domains_done", 0)
-
-    result_file = RESULT_DIR / f"{job_id}_emails.txt"
-    result_file.write_text("\n".join(sorted(existing)), encoding="utf-8")
-    return {"ok": True, "total": len(existing)}
+    
+    # Save emails to database
+    if new_emails:
+        await db.save_emails(job_id, new_emails)
+    
+    # Update slave stats
+    if slave_id:
+        await db.update_slave(slave_id,
+            emails_found=data.get("total_emails", len(new_emails)),
+            domains_done=data.get("domains_done", 0)
+        )
+    
+    # Get total count
+    count_result = await db.db.fetch_one(
+        "SELECT COUNT(*) FROM emails WHERE job_id = :job_id",
+        {"job_id": job_id}
+    )
+    total = count_result[0] if count_result else 0
+    
+    return {"ok": True, "total": total}
 
 
 # ── Download results ───────────────────────────────────────────────────────────
@@ -1134,8 +1130,10 @@ async def collect_emails(job_id: str, data: dict):
 async def download_emails(job_id: str):
     fpath = RESULT_DIR / f"{job_id}_emails.txt"
     if not fpath.exists():
-        if job_id in jobs and jobs[job_id]["emails"]:
-            fpath.write_text("\n".join(sorted(set(jobs[job_id]["emails"]))), encoding="utf-8")
+        # Generate file from database
+        emails = await db.get_emails(job_id)
+        if emails:
+            fpath.write_text("\n".join(sorted(emails)), encoding="utf-8")
         else:
             raise HTTPException(404, "No results yet")
     return FileResponse(str(fpath), filename=f"emails_{job_id}.txt",
@@ -1145,65 +1143,48 @@ async def download_emails(job_id: str):
 # ── API: Jobs listing ──────────────────────────────────────────────────────────
 
 @app.get("/api/jobs")
-async def list_jobs(search: str = None, page: int = 1, limit: int = 50):
+async def list_jobs_endpoint(search: str = None, page: int = 1, limit: int = 50):
     """List jobs with search and pagination. Returns most recent first."""
-    all_jobs = [
-        {k: v for k, v in j.items() if k != "emails"}
-        for j in jobs.values()
-    ]
-    
-    # Filter by search term
-    if search:
-        search_lower = search.lower()
-        all_jobs = [j for j in all_jobs if 
-                    search_lower in j.get("name", "").lower() or
-                    search_lower in j.get("id", "").lower() or
-                    search_lower in j.get("status", "").lower()]
-    
-    # Sort by created_at descending (most recent first)
-    all_jobs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    
-    # Pagination
-    total = len(all_jobs)
-    start = (page - 1) * limit
-    end = start + limit
-    paginated = all_jobs[start:end]
-    
-    return {
-        "jobs": paginated,
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "total_pages": (total + limit - 1) // limit
-    }
+    result = await db.list_jobs(search=search, page=page, limit=limit)
+    return result
 
 
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(404)
-    j = dict(jobs[job_id])
-    j["emails_preview"] = j["emails"][:20]
-    j["emails"] = None
-    return j
+async def get_job_endpoint(job_id: str):
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    
+    # Get preview of emails
+    emails_data = await db.get_emails_paginated(job_id, page=1, limit=20)
+    job["emails_preview"] = [e["email"] for e in emails_data.get("emails", [])]
+    job["emails"] = None  # Don't include full email list
+    
+    return job
 
 
 @app.post("/api/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
     """Cancel a running job and notify all slaves to stop."""
     global job_cancel_flags
-    if job_id not in jobs:
+    
+    job = await db.get_job(job_id)
+    if not job:
         raise HTTPException(404, "Job not found")
     
-    job = jobs[job_id]
     if job["status"] in ("completed", "failed", "cancelled"):
         raise HTTPException(400, f"Cannot cancel job with status: {job['status']}")
     
     # Set cancellation flag
     job_cancel_flags[job_id] = True
-    job["status"] = "cancelled"
-    job["finished_at"] = datetime.now().isoformat()
-    job["error"] = "Job cancelled by user"
+    await db.update_job(job_id, 
+        status="cancelled",
+        finished_at=datetime.now().isoformat(),
+        error="Job cancelled by user"
+    )
+    
+    # Log the cancellation
+    await db.log_activity("info", "jobs", f"Job {job_id} cancelled by user", {"job_id": job_id})
     
     # Notify all slaves to cancel this job
     await _notify_slaves_cancel(job_id)
@@ -1211,26 +1192,47 @@ async def cancel_job(job_id: str):
     return {"ok": True, "status": "cancelled"}
 
 
+@app.delete("/api/jobs/{job_id}")
+async def delete_job_endpoint(job_id: str):
+    """Delete a job and all associated data."""
+    deleted = await db.delete_job(job_id)
+    if deleted:
+        # Also delete result file if exists
+        result_file = RESULT_DIR / f"{job_id}_emails.txt"
+        if result_file.exists():
+            result_file.unlink()
+        return {"ok": True, "message": "Job deleted"}
+    raise HTTPException(404, "Job not found")
+
+
 async def _notify_slaves_cancel(job_id: str):
     """Send cancellation signal to all slaves working on a job."""
-    job = jobs.get(job_id)
+    job = await db.get_job(job_id)
     if not job:
         return
     
     # Get slaves assigned to this job
-    assigned_slaves = list(job.get("domains_per_slave", {}).keys())
+    assignments = await db.get_job_assignments(job_id)
+    assigned_slaves = [a["slave_id"] for a in assignments]
     if not assigned_slaves:
         return
+    
+    # Get slave URLs
+    slaves_data = {}
+    for sid in assigned_slaves:
+        slave = await db.get_slave(sid)
+        if slave:
+            slaves_data[sid] = slave
     
     async with httpx.AsyncClient(timeout=10.0) as client:
         tasks = []
         for sid in assigned_slaves:
-            if sid in slaves:
-                slave_url = slaves[sid].get("url")
-                if slave_url:
-                    tasks.append(
-                        client.post(f"{slave_url}/api/jobs/{job_id}/cancel")
-                    )
+            slave = slaves_data.get(sid, {})
+            slave_url = slave.get("url")
+            if slave_url:
+                tasks.append(
+                    client.post(f"{slave_url}/api/jobs/{job_id}/cancel")
+                )
         
         if tasks:
             try:
@@ -1242,14 +1244,16 @@ async def _notify_slaves_cancel(job_id: str):
 @app.put("/api/jobs/{job_id}/rename")
 async def rename_job(job_id: str, data: dict):
     """Rename a job."""
-    if job_id not in jobs:
+    job = await db.get_job(job_id)
+    if not job:
         raise HTTPException(404, "Job not found")
     
     new_name = data.get("name", "").strip()
     if not new_name:
         raise HTTPException(400, "Name is required")
     
-    jobs[job_id]["name"] = new_name
+    await db.update_job(job_id, name=new_name)
+    await db.log_activity("info", "jobs", f"Job {job_id} renamed to '{new_name}'", {"job_id": job_id})
     return {"ok": True, "name": new_name}
 
 
@@ -1257,10 +1261,12 @@ async def rename_job(job_id: str, data: dict):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
+    slaves = await db.list_slaves()
+    jobs_result = await db.list_jobs(page=1, limit=50)
     return templates.TemplateResponse("dashboard.html", {
         "request": request,
-        "slaves": list(slaves.values()),
-        "jobs": list(jobs.values()),
+        "slaves": slaves,
+        "jobs": jobs_result.get("jobs", []),
     })
 
 

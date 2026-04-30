@@ -276,35 +276,109 @@ def parse_links(html, base_url, base_domain):
     return links
 
 
-def _clean_html(html):
-    html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL|re.IGNORECASE)
-    html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL|re.IGNORECASE)
+def _clean_html_for_extraction(html: str) -> str:
+    html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
     html = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
     return html
 
 
-def is_valid_email(e):
-    e = e.strip().lower()
-    m = re.match(r"^([a-z0-9]([a-z0-9_.+\-]*[a-z0-9])?)@([a-z0-9][a-z0-9.\-]*[a-z0-9])\.([a-z]{2,12})$", e)
-    if not m: return False
-    local, domain, tld = m.group(1), m.group(3), m.group(4)
-    if tld not in _REAL_TLDS: return False
-    if local.lower() in _JS_LOCAL_BLACKLIST: return False
-    if tld.lower() in _JS_TLD_BLACKLIST: return False
-    if ".." in e: return False
+def _is_real_tld(tld: str) -> bool:
+    t = tld.lower().strip(".")
+    if not re.match(r"^[a-z]{2,12}$", t):
+        return False
+    return t in _REAL_TLDS
+
+
+def _local_part_ok(local: str) -> bool:
+    l = local.lower().rstrip(".")
+    if len(l) < 2:
+        return False
+    if l in _JS_LOCAL_BLACKLIST:
+        return False
+    for bad in _JS_LOCAL_BLACKLIST:
+        if l == bad or l.startswith(bad + ".") or l.endswith("." + bad):
+            return False
+    if re.match(r"^[a-f0-9\-]{20,}$", l):
+        return False
     return True
 
 
-def extract_emails(html):
-    clean = _clean_html(html)
-    raw = set()
-    raw.update(re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_.+\-]*@[a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,12}", clean))
-    raw.update(re.findall(r"mailto:([a-zA-Z0-9_.+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,12})", html, re.IGNORECASE))
-    out = set()
+def _domain_ok(domain: str, tld: str) -> bool:
+    d = domain.lower()
+    t = tld.lower()
+    if t in _JS_TLD_BLACKLIST:
+        return False
+    sld = d.split(".")[0]
+    if len(sld) < 2 or not re.match(r"^[a-z0-9\-]+$", sld):
+        return False
+    return True
+
+
+def is_valid_email(e: str) -> bool:
+    e = e.strip().lower()
+    m = re.match(
+        r"^([a-z0-9]([a-z0-9_.+\-]*[a-z0-9])?)@([a-z0-9][a-z0-9.\-]*[a-z0-9])\.([a-z]{2,12})$",
+        e,
+    )
+    if not m:
+        return False
+    local, domain, tld = m.group(1), m.group(3), m.group(4)
+    if not _is_real_tld(tld):
+        return False
+    if not _local_part_ok(local):
+        return False
+    if not _domain_ok(domain, tld):
+        return False
+    if ".." in e:
+        return False
+    return True
+
+
+def extract_emails(html: str) -> set:
+    clean = _clean_html_for_extraction(html)
+    raw: set = set()
+
+    raw.update(
+        re.findall(
+            r"[a-zA-Z0-9][a-zA-Z0-9_.+\-]*@[a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,12}",
+            clean,
+        )
+    )
+
+    raw.update(
+        re.findall(
+            r"mailto:([a-zA-Z0-9_.+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,12})",
+            html,
+            re.IGNORECASE,
+        )
+    )
+
+    for m in re.findall(
+        r"([a-zA-Z0-9_.+\-]{2,})(?:&#64;|%40)([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,12})",
+        html,
+        re.IGNORECASE,
+    ):
+        raw.add(f"{m[0]}@{m[1]}")
+
+    for m in re.findall(
+        r"(?<![a-zA-Z])([a-zA-Z0-9_.+\-]{3,})"
+        r"\s*[\[\(]?\s*(?:at|AT)\s*[\]\)]?\s*"
+        r"([a-zA-Z0-9\-]{2,})"
+        r"\s*[\[\(]?\s*(?:dot|DOT|\.)\s*[\]\)]?\s*"
+        r"([a-zA-Z]{2,12})"
+        r"(?![a-zA-Z])",
+        html,
+    ):
+        raw.add(f"{m[0]}@{m[1]}.{m[2]}")
+
+    out: set = set()
     for e in raw:
         el = e.lower().strip()
-        if any(kw in el for kw in _EXCL_SUBSTRINGS): continue
-        if is_valid_email(el): out.add(el)
+        if any(kw in el for kw in _EXCL_SUBSTRINGS):
+            continue
+        if is_valid_email(el):
+            out.add(el)
     return out
 
 

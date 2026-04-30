@@ -618,9 +618,20 @@ _monitor_task = None
 
 
 async def _heartbeat_monitor():
-    """Background task: pings all registered slaves every HEARTBEAT_INTERVAL."""
+    """Background task: pings all registered slaves every HEARTBEAT_INTERVAL.
+    Updates both in-memory cache AND database with system stats."""
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
+        
+        # Reload slaves from database
+        try:
+            db_slaves = await db.list_slaves()
+            for s in db_slaves:
+                if s["id"] not in slaves:
+                    slaves[s["id"]] = s
+        except Exception:
+            pass
+        
         if not slaves:
             continue
 
@@ -628,15 +639,36 @@ async def _heartbeat_monitor():
             for sid, s in list(slaves.items()):
                 if s.get("status") == "provisioning":
                     continue  # Don't ping during provisioning
+                
+                slave_url = s.get("url", "")
+                if not slave_url:
+                    continue
+                    
                 try:
-                    r = await client.get(f"{s['url']}/api/health")
+                    r = await client.get(f"{slave_url}/api/health")
                     data = r.json()
-                    s["last_seen"] = datetime.now().isoformat()
-                    s["system_stats"] = data.get("system_stats", {})
+                    now_iso = datetime.now().isoformat()
+                    system_stats = data.get("system_stats", {})
+                    
+                    # Update in-memory
+                    s["last_seen"] = now_iso
+                    s["system_stats"] = system_stats
 
+                    # Update database
+                    update_data = {
+                        "last_seen": now_iso,
+                        "system_stats": system_stats
+                    }
+                    
                     # If it was marked dead/error but responded, revive
                     if s["status"] in ("dead", "offline", "error"):
                         s["status"] = "idle"
+                        update_data["status"] = "idle"
+                    
+                    try:
+                        await db.update_slave(sid, **update_data)
+                    except Exception:
+                        pass
 
                 except Exception:
                     # Calculate time since last seen
@@ -648,6 +680,10 @@ async def _heartbeat_monitor():
 
                     if elapsed > HEARTBEAT_TIMEOUT:
                         s["status"] = "offline"
+                        try:
+                            await db.update_slave(sid, status="offline")
+                        except Exception:
+                            pass
 
 
 # ── Slave Management ───────────────────────────────────────────────────────────

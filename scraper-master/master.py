@@ -160,8 +160,9 @@ async def _dns_check_async(host: str, resolver=None) -> bool:
     """Async DNS check using aiodns if available, otherwise fallback to socket."""
     if HAS_AIODNS and resolver:
         try:
-            await asyncio.wait_for(resolver.query(host, 'A'), timeout=DNS_TIMEOUT)
-            return True
+            # Use query_dns() for aiodns >= 4.0.0 (query() is deprecated)
+            result = await asyncio.wait_for(resolver.query_dns(host, 'A'), timeout=DNS_TIMEOUT)
+            return bool(result)  # Returns list of results if successful
         except Exception:
             # aiodns failed, fall back to sync socket method
             pass

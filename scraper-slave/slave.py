@@ -571,6 +571,65 @@ def _heartbeat_loop():
             pass  # Master unreachable — will retry next interval
 
 
+# ── System Control Endpoints ────────────────────────────────────────────────────
+
+_pause_flag = threading.Event()
+
+@app.post("/api/system/restart-service")
+async def restart_service():
+    """Restart the scraper-slave service (clears memory)."""
+    import subprocess
+    try:
+        # Schedule restart after returning response
+        def do_restart():
+            time.sleep(1)
+            subprocess.run(["systemctl", "restart", "scraper-slave"], check=False)
+        
+        threading.Thread(target=do_restart, daemon=True).start()
+        return {"ok": True, "message": "Service restart initiated"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)[:100]}
+
+
+@app.post("/api/system/pause")
+async def pause_jobs():
+    """Pause all active jobs."""
+    global _pause_flag
+    _pause_flag.set()
+    return {"ok": True, "message": "Jobs paused"}
+
+
+@app.post("/api/system/resume")
+async def resume_jobs():
+    """Resume all paused jobs."""
+    global _pause_flag
+    _pause_flag.clear()
+    return {"ok": True, "message": "Jobs resumed"}
+
+
+@app.post("/api/system/reboot")
+async def reboot_vps():
+    """Reboot the VPS (requires sudo)."""
+    import subprocess
+    try:
+        subprocess.run(["sudo", "reboot"], check=False)
+        return {"ok": True, "message": "Reboot initiated"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)[:100]}
+
+
+@app.get("/api/system/status")
+async def system_status():
+    """Get system status including pause state."""
+    return {
+        "ok": True,
+        "slave_id": SLAVE_ID,
+        "paused": _pause_flag.is_set(),
+        "active_jobs": len(active_jobs),
+        "system_stats": _get_system_stats(),
+    }
+
+
 @app.on_event("startup")
 async def start_heartbeat():
     t = threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat")

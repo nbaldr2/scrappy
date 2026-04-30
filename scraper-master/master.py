@@ -868,15 +868,21 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool):
 
 
 async def _poll_until_done(job_id: str):
-    """Poll slave progress until all done."""
+    """Poll slave progress until all done with progress tracking."""
     job = jobs[job_id]
     active = {k: v for k, v in slaves.items()
               if k in job["domains_per_slave"]}
-
+    
+    # Track progress
+    total_domains = sum(job["domains_per_slave"].values())
+    job["progress"] = {"percent": 0, "elapsed_seconds": 0, "estimated_seconds": 0, "rate": 0}
+    start_time = datetime.now()
+    
     while True:
         await asyncio.sleep(5)
         all_done = True
         total_emails = []
+        total_done = 0
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             for sid, sinfo in active.items():
@@ -887,6 +893,7 @@ async def _poll_until_done(job_id: str):
                     sinfo["domains_done"] = data.get("domains_done", 0)
                     sinfo["emails_found"] = data.get("emails_found", 0)
                     sinfo["last_seen"] = datetime.now().isoformat()
+                    total_done += data.get("domains_done", 0)
 
                     if data.get("status") not in ("completed", "failed"):
                         all_done = False
@@ -898,6 +905,24 @@ async def _poll_until_done(job_id: str):
         unique = list(set(total_emails))
         job["emails"] = unique
         job["emails_count"] = len(unique)
+        
+        # Calculate progress
+        elapsed = (datetime.now() - start_time).total_seconds()
+        if total_domains > 0 and total_done > 0:
+            percent = min(100, (total_done / total_domains) * 100)
+            rate = total_done / elapsed if elapsed > 0 else 0
+            remaining = total_domains - total_done
+            estimated = remaining / rate if rate > 0 else 0
+            job["progress"] = {
+                "percent": round(percent, 1),
+                "elapsed_seconds": round(elapsed),
+                "estimated_seconds": round(estimated),
+                "rate": round(rate, 1),
+                "domains_done": total_done,
+                "domains_total": total_domains
+            }
+        
+        save_state()  # Save progress periodically
 
         if all_done:
             break

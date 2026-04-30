@@ -41,8 +41,8 @@ BASE_DIR    = Path(__file__).parent
 UPLOAD_DIR  = BASE_DIR / "uploads"
 RESULT_DIR  = BASE_DIR / "results"
 SLAVE_DIR   = BASE_DIR.parent / "scraper-slave"
-UPLOAD_DIR.mkdir(exist_ok=True)
-RESULT_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Provisioning logs:  {slave_id: [log_lines]} ────────────────────────────────
 provision_logs: dict[str, list] = {}
@@ -953,6 +953,10 @@ async def slave_heartbeat(slave_id: str, data: dict):
 async def upload_domains(file: UploadFile = File(...), name: str = Form(None)):
     """Upload domain list — stored for processing."""
     try:
+        # Ensure upload directory exists
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        RESULT_DIR.mkdir(parents=True, exist_ok=True)
+        
         content = (await file.read()).decode("utf-8", errors="ignore")
         lines = content.strip().splitlines()
         job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:6]

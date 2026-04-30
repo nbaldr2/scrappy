@@ -50,6 +50,9 @@ provision_logs: dict[str, list] = {}
 # ── In-memory slaves cache for provisioning (synced with database) ─────────────
 slaves: dict[str, dict] = {}
 
+# ── Main event loop reference (for thread-safe database access) ────────────────
+_main_loop: asyncio.AbstractEventLoop = None
+
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -60,6 +63,9 @@ async def lifespan(app: FastAPI):
     print("Initializing database...")
     await db.init_database()
     print("Database connected and tables created")
+    # Store main event loop reference for thread-safe DB access
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
     # Start heartbeat monitor
     _monitor_task = asyncio.create_task(_heartbeat_monitor())
     print("Heartbeat monitor started")
@@ -556,23 +562,20 @@ WantedBy=multi-user.target
         slaves[sid]["last_seen"] = datetime.now().isoformat()
         log("✅ Provisioning complete!")
         
-        # 9. Register slave in database (run in async context from thread)
-        log("Registering slave in database...")
+        # 9. Update slave status in database via main event loop
+        log("Updating slave status in database...")
         try:
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(db.register_slave(
-                sid,
-                slaves[sid]["url"],
-                slave_name,
-                ip
-            ))
-            loop.run_until_complete(db.update_slave(sid, status="idle"))
-            loop.close()
-            log("✓ Slave registered in database")
+            if _main_loop and not _main_loop.is_closed():
+                future = asyncio.run_coroutine_threadsafe(
+                    db.update_slave(sid, status="idle"),
+                    _main_loop
+                )
+                future.result(timeout=10)  # Wait up to 10s for the update
+                log("✓ Slave status updated in database")
+            else:
+                log("⚠ Main event loop not available, skipping DB update")
         except Exception as db_err:
-            log(f"⚠ Database registration failed: {str(db_err)[:100]}")
+            log(f"⚠ Database update failed: {str(db_err)[:100]}")
 
     except paramiko.AuthenticationException:
         log("✗ Authentication failed — check user/password")
@@ -678,10 +681,11 @@ async def provision_slave(data: dict):
         # Auto-detect: assume master is accessible from slave at this IP
         master_url = f"http://{data.get('master_ip', ip)}:8000"
 
-    # Register slave immediately (status=provisioning)
+    # Register slave immediately in memory and database (status=provisioning)
+    slave_url = f"http://{ip}:{slave_port}"
     slaves[sid] = {
         "id": sid,
-        "url": f"http://{ip}:{slave_port}",
+        "url": slave_url,
         "name": name,
         "ip": ip,
         "status": "provisioning",
@@ -692,6 +696,10 @@ async def provision_slave(data: dict):
         "system_stats": {},
         "provision_progress": "queued",
     }
+    
+    # Register in database from async context (before thread starts)
+    await db.register_slave(sid, slave_url, name, ip)
+    await db.update_slave(sid, status="provisioning")
 
     # Run provisioning in background thread (blocking SSH calls)
     thread = threading.Thread(

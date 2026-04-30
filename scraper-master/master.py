@@ -526,7 +526,9 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
         # 4. Create venv + install Python deps (skip if venv already has everything)
         log("Setting up Python environment...")
         slaves[sid]["provision_progress"] = "installing_python"
-        venv_ok = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/python && {REMOTE_DIR}/venv/bin/python -c 'import fastapi,uvicorn,httpx,requests,lxml,cssselect,colorama,pydantic' 2>/dev/null && echo OK", timeout=10).strip()
+        
+        # Check if venv exists AND has pip AND packages work
+        venv_ok = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/pip && {REMOTE_DIR}/venv/bin/python -c 'import fastapi,uvicorn,httpx,requests,lxml,cssselect,colorama,pydantic' 2>/dev/null && echo OK", timeout=10).strip()
         if venv_ok.endswith("OK"):
             log("✓ Python venv and packages already installed — skipping")
         else:

@@ -926,27 +926,42 @@ async def start_job(job_id: str, workers: int = 12, turbo: bool = True,
 async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool):
     job = await db.get_job(job_id)
     if not job:
+        print(f"[ERROR] Job {job_id} not found in database")
         return
     
     try:
+        print(f"[JOB {job_id}] Starting job processing...")
+        
         # 1. Load raw domains
-        raw_lines = Path(job["file_path"]).read_text(encoding="utf-8").splitlines()
+        file_path = job.get("file_path")
+        if not file_path or not Path(file_path).exists():
+            raise FileNotFoundError(f"Job file not found: {file_path}")
+        
+        print(f"[JOB {job_id}] Loading domains from {file_path}")
+        raw_lines = Path(file_path).read_text(encoding="utf-8").splitlines()
+        print(f"[JOB {job_id}] Loaded {len(raw_lines)} raw lines")
 
         # 2. Clean
         await db.update_job(job_id, status="cleaning")
+        print(f"[JOB {job_id}] Cleaning domains...")
         cleaned, cstats = clean_domains(raw_lines, phase2=True)
+        print(f"[JOB {job_id}] Cleaned: {len(cleaned)} domains. Stats: {cstats}")
         await db.update_job(job_id, domains_cleaned=len(cleaned), clean_stats=cstats)
 
         # 3. DNS filter
         live = cleaned
         if dns_on and cleaned:
             await db.update_job(job_id, status="dns_filtering")
+            print(f"[JOB {job_id}] Starting DNS filtering on {len(cleaned)} domains...")
             live, dead = await dns_filter_async(cleaned, job_id)
+            print(f"[JOB {job_id}] DNS filtering complete: {len(live)} live, {dead} dead")
             await db.update_job(job_id, domains_live=len(live), dns_stats={"alive": len(live), "dead": dead})
         else:
+            print(f"[JOB {job_id}] Skipping DNS filter (dns_on={dns_on})")
             await db.update_job(job_id, domains_live=len(live))
 
         if not live:
+            print(f"[JOB {job_id}] No live domains, completing job")
             await db.update_job(job_id, status="completed", finished_at=datetime.now())
             return
 
@@ -1005,6 +1020,9 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool):
         await _poll_until_done(job_id)
 
     except Exception as e:
+        import traceback
+        error_msg = f"{str(e)}\n{traceback.format_exc()}"
+        print(f"[ERROR] Job {job_id} failed: {error_msg}")
         await db.update_job(job_id, status="failed", error=str(e)[:500])
         await db.log_activity("error", "jobs", f"Job {job_id} failed: {str(e)[:100]}", {"job_id": job_id})
 

@@ -497,20 +497,23 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
         sftp.close()
 
         # 3. Install system deps + Python venv
-        log("Installing system packages...")
+        log("Updating apt package lists (may take 30-60s)...")
         slaves[sid]["provision_progress"] = "installing_system"
-        _exec(ssh, "apt-get update -qq && apt-get install -y python3 python3-pip python3-venv",
-              timeout=120)
+        _exec(ssh, "apt-get update -qq", timeout=180)
+        log("✓ Package lists updated — installing python3...")
+        _exec(ssh, "apt-get install -y python3 python3-pip python3-venv --no-install-recommends -qq",
+              timeout=300)
         log("✓ System packages installed")
 
         # 4. Create venv + install Python deps
         log("Creating Python venv...")
         slaves[sid]["provision_progress"] = "installing_python"
-        _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv", timeout=30)
-        log("Installing Python packages...")
-        _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q && "
-                    f"venv/bin/pip install -r requirements.txt -q",
-              timeout=120)
+        _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv", timeout=60)
+        log("Upgrading pip...")
+        _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q", timeout=60)
+        log("Installing Python packages (may take 60-120s)...")
+        _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install -r requirements.txt -q",
+              timeout=300)
         log("✓ Python dependencies installed")
 
         # 5. Create systemd service

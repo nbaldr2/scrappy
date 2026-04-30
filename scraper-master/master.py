@@ -507,15 +507,19 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
                   timeout=300)
             log("✓ Python3 installed")
 
-        # 4. Create venv + install Python deps
-        log("Creating Python venv...")
+        # 4. Create venv + install Python deps (skip if venv already has everything)
+        log("Setting up Python environment...")
         slaves[sid]["provision_progress"] = "installing_python"
-        _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv", timeout=60)
-        log("Installing Python packages (may take 30-90s)...")
-        _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q && "
-                    f"venv/bin/pip install --no-cache-dir -r requirements.txt -q",
-              timeout=300)
-        log("✓ Python dependencies installed")
+        venv_ok = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/python && {REMOTE_DIR}/venv/bin/python -c 'import fastapi,uvicorn,httpx,requests,lxml,cssselect,colorama,pydantic' 2>/dev/null && echo OK", timeout=10).strip()
+        if venv_ok.endswith("OK"):
+            log("✓ Python venv and packages already installed — skipping")
+        else:
+            _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv", timeout=60)
+            log("Installing Python packages (may take 30-90s)...")
+            _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q && "
+                        f"venv/bin/pip install --no-cache-dir -r requirements.txt -q",
+                  timeout=300)
+            log("✓ Python dependencies installed")
 
         # 5. Create systemd service
         log("Configuring systemd service...")

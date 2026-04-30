@@ -1021,11 +1021,31 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool, master_
         
         # 1. Load raw domains
         file_path = job.get("file_path")
-        if not file_path or not Path(file_path).exists():
-            raise FileNotFoundError(f"Job file not found: {file_path}")
         
-        print(f"[JOB {job_id}] Loading domains from {file_path}")
-        raw_lines = Path(file_path).read_text(encoding="utf-8").splitlines()
+        # Try multiple path formats (old: JOB_ID.txt, new: JOB_ID/domains.txt)
+        candidates = []
+        if file_path:
+            candidates.append(Path(file_path))
+        # New format: uploads/JOB_ID/domains.txt
+        candidates.append(UPLOAD_DIR / job_id / "domains.txt")
+        # Old format: uploads/JOB_ID.txt
+        candidates.append(UPLOAD_DIR / f"{job_id}.txt")
+        
+        resolved_path = None
+        for p in candidates:
+            if p.exists():
+                resolved_path = p
+                break
+        
+        if not resolved_path:
+            raise FileNotFoundError(f"Job file not found. Tried: {[str(p) for p in candidates]}")
+        
+        # Update file_path in DB if it changed
+        if str(resolved_path) != file_path:
+            await db.update_job(job_id, file_path=str(resolved_path))
+        
+        print(f"[JOB {job_id}] Loading domains from {resolved_path}")
+        raw_lines = resolved_path.read_text(encoding="utf-8").splitlines()
         print(f"[JOB {job_id}] Loaded {len(raw_lines)} raw lines")
 
         # 2. Clean

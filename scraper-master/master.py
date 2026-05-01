@@ -187,7 +187,7 @@ def clean_domains(raw_lines: list[str], phase2: bool = True) -> tuple[list[str],
 # ── DNS Pre-Filter (Robust Multi-Record-Type with Retry) ──────────────────────
 
 DNS_TIMEOUT = 3.0  # 3 seconds timeout for DNS resolution
-DNS_MAX_WORKERS = 1000  # 1000 concurrent workers
+DNS_MAX_WORKERS = 500  # 500 concurrent workers
 DNS_MAX_RETRIES = 1  # 1 retry for failed lookups
 DNS_RETRY_DELAY = 0.3  # 300ms delay between retries
 BATCH_SIZE = 2000  # Process in 2000-domain batches
@@ -195,13 +195,9 @@ BATCH_SIZE = 2000  # Process in 2000-domain batches
 # Global cancellation flags for jobs
 job_cancel_flags: dict[str, bool] = {}
 
-# DNS statistics for debugging
-dns_stats = {"total": 0, "a_records": 0, "aaaa_records": 0, "cname_records": 0, "retried": 0, "failed": 0}
 
-async def _dns_query_with_retry(resolver, host: str, qtype: str) -> list:
+async def _dns_query_with_retry(resolver, host: str, qtype: str, stats: dict) -> list:
     """Query DNS with retry logic for transient failures."""
-    global dns_stats
-    
     for attempt in range(DNS_MAX_RETRIES + 1):
         try:
             if HAS_AIODNS and resolver:
@@ -212,57 +208,38 @@ async def _dns_query_with_retry(resolver, host: str, qtype: str) -> list:
                 if result:
                     return result
             else:
-                # Fallback to dnspython or socket
                 return []
         except asyncio.TimeoutError:
             if attempt < DNS_MAX_RETRIES:
-                dns_stats["retried"] += 1
+                stats["retried"] += 1
                 await asyncio.sleep(DNS_RETRY_DELAY * (attempt + 1))
             continue
         except Exception:
             if attempt < DNS_MAX_RETRIES:
-                dns_stats["retried"] += 1
+                stats["retried"] += 1
                 await asyncio.sleep(DNS_RETRY_DELAY * (attempt + 1))
             continue
-    
+
     return []
 
-async def _dns_check_async_robust(host: str, resolver=None) -> bool:
+
+async def _dns_check_async_robust(host: str, resolver, stats: dict) -> bool:
     """
     Robust async DNS check - tries A, AAAA, and CNAME records.
     Returns True if ANY record type resolves.
     """
-    global dns_stats
-    dns_stats["total"] += 1
-    
-    # Try A record (IPv4)
-    try:
-        a_result = await _dns_query_with_retry(resolver, host, 'A')
-        if a_result:
-            dns_stats["a_records"] += 1
-            return True
-    except Exception:
-        pass
-    
-    # Try AAAA record (IPv6) - many modern sites are IPv6-only
-    try:
-        aaaa_result = await _dns_query_with_retry(resolver, host, 'AAAA')
-        if aaaa_result:
-            dns_stats["aaaa_records"] += 1
-            return True
-    except Exception:
-        pass
-    
-    # Try CNAME - some domains only have CNAME records
-    try:
-        cname_result = await _dns_query_with_retry(resolver, host, 'CNAME')
-        if cname_result:
-            dns_stats["cname_records"] += 1
-            return True
-    except Exception:
-        pass
-    
-    dns_stats["failed"] += 1
+    stats["total"] += 1
+
+    for qtype, key in (('A', 'a_records'), ('AAAA', 'aaaa_records'), ('CNAME', 'cname_records')):
+        try:
+            result = await _dns_query_with_retry(resolver, host, qtype, stats)
+            if result:
+                stats[key] += 1
+                return True
+        except Exception:
+            pass
+
+    stats["failed"] += 1
     return False
 
 def _dns_check_sync_robust(host: str) -> bool:
@@ -299,118 +276,92 @@ def _dns_check_sync_robust(host: str) -> bool:
     
     return False
 
-async def _dns_check_async(host: str, resolver=None) -> bool:
-    """Async DNS check with fallback to sync method."""
-    # First try the robust async method
+async def _dns_check_async(host: str, resolver, stats: dict) -> bool:
+    """Async DNS check with fallback to sync socket method."""
     if HAS_AIODNS and resolver:
         try:
-            result = await _dns_check_async_robust(host, resolver)
-            if result:
+            if await _dns_check_async_robust(host, resolver, stats):
                 return True
         except Exception:
             pass
-    
-    # Fallback to sync socket method in thread pool
-    loop = asyncio.get_event_loop()
+
+    # Fallback to sync socket in thread pool (tracked separately from aiodns stats)
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _dns_check_sync_robust, host)
 
-def _dns_check_sync(host: str) -> bool:
-    """Synchronous DNS check - wrapper for robust version."""
-    return _dns_check_sync_robust(host)
+
 
 async def dns_filter_async(domains: list[str], job_id: str = None) -> tuple[list[str], int]:
     """
     Robust async DNS filter with multi-record-type support and retry logic.
-    Uses reduced concurrency (500) to avoid overwhelming DNS resolvers.
+    Uses 500 concurrent workers to avoid overwhelming DNS resolvers.
     """
-    global job_cancel_flags, dns_stats
-    
     if not domains:
         return [], 0
-    
-    # Reset stats
-    dns_stats = {"total": 0, "a_records": 0, "aaaa_records": 0, "cname_records": 0, "retried": 0, "failed": 0}
-    
+
+    if job_id and job_cancel_flags.get(job_id, False):
+        return [], 0
+
+    # Per-call stats dict — avoids race conditions between concurrent jobs
+    stats = {"total": 0, "a_records": 0, "aaaa_records": 0, "cname_records": 0, "retried": 0, "failed": 0}
+
     live = []
     dead = 0
     total = len(domains)
     checked = 0
     live_count = 0
-    
-    # Check if job was cancelled
-    if job_id and job_cancel_flags.get(job_id, False):
-        return [], 0
-    
-    # Create resolvers with rotating nameservers for better reliability
+
     resolvers = []
     if HAS_AIODNS:
         try:
-            # Create multiple resolvers with different timeout settings
-            for i in range(min(20, (len(domains) // 100) + 1)):
+            for _ in range(min(20, (len(domains) // 100) + 1)):
                 resolvers.append(aiodns.DNSResolver(timeout=DNS_TIMEOUT))
         except Exception:
             resolvers = []
-    
-    # Use more conservative concurrency
+
     semaphore = asyncio.Semaphore(DNS_MAX_WORKERS)
     lock = asyncio.Lock()
-    
+
     async def check_one(domain: str, resolver_idx: int) -> tuple[bool, str]:
         nonlocal checked, live_count
         async with semaphore:
-            # Check for cancellation
             if job_id and job_cancel_flags.get(job_id, False):
                 return False, domain
-            
+
             resolver = resolvers[resolver_idx % len(resolvers)] if resolvers else None
-            result = await _dns_check_async(domain, resolver)
-            
+            result = await _dns_check_async(domain, resolver, stats)
+
             async with lock:
                 checked += 1
                 if result:
                     live_count += 1
-            
+
             return result, domain
-    
-    # Process in batches
-    all_tasks = []
-    
-    for i in range(0, len(domains), BATCH_SIZE):
-        batch = domains[i:i + BATCH_SIZE]
-        batch_tasks = [check_one(d, j) for j, d in enumerate(batch)]
-        all_tasks.extend(batch_tasks)
-        
-        # Brief pause between batch creation to allow DNS resolver recovery
-        if i + BATCH_SIZE < len(domains):
-            await asyncio.sleep(0.05)
-    
-    # Run with progress updates
+
     async def update_progress():
         while checked < total:
             await asyncio.sleep(0.5)
-            if job_id and job_id in jobs:
-                jobs[job_id]["dns_progress"] = {
-                    "checked": checked, 
-                    "total": total, 
+            if job_id:
+                await db.update_job(job_id, progress={
+                    "stage": "dns",
+                    "checked": checked,
+                    "total": total,
                     "live": live_count,
-                    "percent": round((checked / total) * 100, 1) if total > 0 else 0
-                }
-    
-    # Start progress updater
+                    "percent": round((checked / total) * 100, 1) if total > 0 else 0,
+                })
+
     progress_task = asyncio.create_task(update_progress()) if job_id else None
-    
+
+    all_tasks = [check_one(d, j) for j, d in enumerate(domains)]
+
     try:
-        # Run all DNS checks with return_exceptions to capture all results
         results = await asyncio.gather(*all_tasks, return_exceptions=True)
-        
+
         for result in results:
             if job_id and job_cancel_flags.get(job_id, False):
-                if progress_task:
-                    progress_task.cancel()
                 return live, dead
-            
+
             if isinstance(result, Exception):
-                # Log exception details for debugging
                 dead += 1
             elif isinstance(result, tuple):
                 is_live, domain = result
@@ -420,8 +371,8 @@ async def dns_filter_async(domains: list[str], job_id: str = None) -> tuple[list
                     dead += 1
             else:
                 dead += 1
-                
-    except Exception as e:
+
+    except Exception:
         pass
     finally:
         if progress_task:
@@ -430,10 +381,8 @@ async def dns_filter_async(domains: list[str], job_id: str = None) -> tuple[list
                 await progress_task
             except Exception:
                 pass
-    
-    # Log DNS statistics for debugging
-    print(f"DNS Stats: {dns_stats}")
-    
+
+    print(f"DNS Stats: {stats}")
     return live, dead
 
 
@@ -497,84 +446,78 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
                 log(f"  ⚠ {fname} not found locally")
         sftp.close()
 
-        # 3. Check if python3 + venv already installed — skip apt if present
+        # 3. Ensure python3 + python3-venv + version-specific venv package are all installed
+        #    KEY FIX: python3.X-venv is required for venv to include pip (ensurepip).
+        #    Without it, `python3 -m venv` succeeds but creates a venv WITHOUT pip.
         slaves[sid]["provision_progress"] = "installing_system"
-        has_python = _exec(ssh, "which python3 2>/dev/null && python3 --version", timeout=10).strip()
-        if has_python and "Python 3" in has_python:
-            log(f"✓ Python3 already installed: {has_python.split()[-1]}")
-            # Still ensure python3-venv is available (often missing on minimal VPS)
-            py_ver = _exec(ssh, "python3 -c 'import sys; print(f\"python3.{sys.version_info.minor}-venv\")'", timeout=10).strip()
-            has_venv = _exec(ssh, f"dpkg -l {py_ver} 2>/dev/null | grep -q ^ii && echo YES || echo NO", timeout=10).strip()
-            if has_venv != "YES":
-                log(f"Installing {py_ver} (may take 30-60s)...")
-                try:
-                    _exec(ssh, f"apt-get update -qq && apt-get install -y {py_ver} --no-install-recommends -qq", timeout=300, check=True)
-                    log(f"✓ {py_ver} installed")
-                except RuntimeError as apt_err:
-                    log(f"✗ Failed to install {py_ver}: {str(apt_err)[:100]}")
-                    raise
+        py_ver_full = _exec(ssh, "python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")' 2>/dev/null || echo 'none'", timeout=10).strip()
+        
+        if py_ver_full and py_ver_full != "none":
+            # python3 exists — check if ensurepip works (this is the real test)
+            # `import venv` can succeed even without python3.X-venv, but ensurepip fails
+            ensurepip_test = _exec(ssh, "python3 -c 'import ensurepip; print(\"OK\")' 2>/dev/null || echo FAIL", timeout=10).strip()
+            if ensurepip_test == "OK":
+                log(f"✓ Python3 {py_ver_full} + venv+ensurepip available")
+            else:
+                # ensurepip missing — MUST install python3.X-venv for pip to work in venv
+                venv_pkg = f"python3.{py_ver_full.split('.')[1]}-venv"
+                log(f"Python3 {py_ver_full} found but ensurepip missing — installing {venv_pkg}...")
+                _exec(ssh, f"apt-get update -qq && apt-get install -y python3-venv {venv_pkg} --no-install-recommends -qq", timeout=300)
+                # Verify ensurepip now works
+                ensurepip_retest = _exec(ssh, "python3 -c 'import ensurepip; print(\"OK\")' 2>/dev/null || echo FAIL", timeout=10).strip()
+                if ensurepip_retest == "OK":
+                    log(f"✓ {venv_pkg} installed, ensurepip working")
+                else:
+                    log(f"⚠ {venv_pkg} installed but ensurepip still failing — will use get-pip.py fallback")
         else:
+            # No python3 at all — install everything including version-specific venv
             log("Installing python3 + venv (may take 60-120s on fresh VPS)...")
-            try:
-                _exec(ssh, "apt-get update -qq && apt-get install -y python3 python3-venv python3.12-venv --no-install-recommends -qq",
-                      timeout=300, check=True)
-                log("✓ Python3 installed")
-            except RuntimeError as apt_err:
-                log(f"✗ Failed to install python3: {str(apt_err)[:100]}")
-                raise
+            _exec(ssh, "apt-get update -qq && apt-get install -y python3 python3-venv --no-install-recommends -qq",
+                  timeout=300)
+            # Detect version and install matching venv package
+            py_ver_full = _exec(ssh, "python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")'", timeout=10).strip()
+            if py_ver_full:
+                venv_pkg = f"python3.{py_ver_full.split('.')[1]}-venv"
+                _exec(ssh, f"apt-get install -y {venv_pkg} --no-install-recommends -qq 2>/dev/null || true", timeout=120)
+            log("✓ Python3 + venv packages installed")
 
-        # 4. Create venv + install Python deps (skip if venv already has everything)
+        # 4. Create venv + install Python deps
         log("Setting up Python environment...")
         slaves[sid]["provision_progress"] = "installing_python"
         
-        # Check if venv exists AND has pip AND packages work
+        # Check if venv exists AND has pip AND all packages work
         venv_ok = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/pip && {REMOTE_DIR}/venv/bin/python -c 'import fastapi,uvicorn,httpx,requests,lxml,cssselect,colorama,pydantic' 2>/dev/null && echo OK", timeout=10).strip()
         if venv_ok.endswith("OK"):
             log("✓ Python venv and packages already installed — skipping")
         else:
-            # Try to create venv with error checking
-            try:
-                _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv --clear", timeout=60, check=True)
-            except RuntimeError as e:
-                log(f"⚠ venv creation failed: {str(e)[:100]}")
-                # Likely missing python3.X-venv package, try to install it
-                log("Installing python3-venv package...")
-                py_ver = _exec(ssh, "python3 -c 'import sys; print(f\"python3.{sys.version_info.minor}-venv\")'", timeout=10).strip()
-                try:
-                    _exec(ssh, f"apt-get update -qq && apt-get install -y {py_ver} --no-install-recommends -qq", timeout=300, check=True)
-                    log(f"✓ {py_ver} installed, retrying venv creation...")
-                    _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv --clear", timeout=60, check=True)
-                except RuntimeError as apt_err:
-                    log(f"✗ Failed to install {py_ver}: {str(apt_err)[:100]}")
-                    raise
+            # Remove any broken venv first
+            _exec(ssh, f"rm -rf {REMOTE_DIR}/venv", timeout=10)
             
-            # Verify venv was created successfully
-            venv_check = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/pip && echo OK || echo FAIL", timeout=10).strip()
-            if venv_check != "OK":
-                log("⚠ pip not found in venv, trying --without-pip fallback...")
+            # Create venv — this should work now since we ensured python3-venv above
+            log("Creating Python venv...")
+            _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv", timeout=60)
+            
+            # CRITICAL: Verify pip exists in the venv (python3-venv missing causes venv without pip)
+            pip_check = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/pip && echo OK || echo FAIL", timeout=10).strip()
+            if pip_check != "OK":
+                log("⚠ pip missing from venv — installing via get-pip.py...")
+                # Use --without-pip to create a clean venv, then bootstrap pip
                 _exec(ssh, f"rm -rf {REMOTE_DIR}/venv && cd {REMOTE_DIR} && python3 -m venv venv --without-pip", timeout=60)
-                # Install pip via get-pip.py
-                _exec(ssh, f"cd {REMOTE_DIR} && curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py && {REMOTE_DIR}/venv/bin/python get-pip.py && rm get-pip.py", timeout=120)
-            
-            # Final verification before installing packages
-            final_check = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/pip && echo OK || echo FAIL", timeout=10).strip()
-            if final_check != "OK":
-                raise RuntimeError("venv/bin/pip does not exist after all attempts")
+                _exec(ssh, f"cd {REMOTE_DIR} && curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py && {REMOTE_DIR}/venv/bin/python get-pip.py && rm -f get-pip.py", timeout=120)
+                
+                # Re-verify pip exists
+                pip_check2 = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/pip && echo OK || echo FAIL", timeout=10).strip()
+                if pip_check2 != "OK":
+                    raise RuntimeError("Failed to create venv with pip — python3-venv may be broken on this VPS")
             
             log("Installing Python packages (may take 30-90s)...")
-            # Use check=True to catch pip install failures
-            try:
-                _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q", timeout=120, check=True)
-                _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --no-cache-dir -r requirements.txt -q", timeout=300, check=True)
-            except RuntimeError as pip_err:
-                log(f"✗ pip install failed: {str(pip_err)[:150]}")
-                raise
+            _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q", timeout=120)
+            _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --no-cache-dir -r requirements.txt -q", timeout=300)
             
             # Verify packages actually work
-            verify = _exec(ssh, f"{REMOTE_DIR}/venv/bin/python -c 'import fastapi,uvicorn,httpx,requests,lxml,cssselect,colorama,pydantic' 2>&1 && echo 'VERIFIED'", timeout=15).strip()
-            if not verify.endswith('VERIFIED'):
-                log("✗ Package verification failed after installation")
-                raise RuntimeError("Packages installed but import test failed")
+            verify = _exec(ssh, f"{REMOTE_DIR}/venv/bin/python -c 'import fastapi,uvicorn,httpx,requests,lxml,cssselect,colorama,pydantic' 2>&1 && echo VERIFIED", timeout=15).strip()
+            if not verify.endswith("VERIFIED"):
+                raise RuntimeError("Package import verification failed after installation")
             log("✓ Python dependencies installed and verified")
 
         # 5. Create systemd service
@@ -1279,7 +1222,7 @@ async def _poll_until_done(job_id: str):
             {"job_id": job_id}
         )
         total_emails_count = email_count_result[0] if email_count_result else 0
-        
+
         # Calculate progress
         elapsed = (datetime.now() - start_time).total_seconds()
         progress = None
@@ -1294,7 +1237,8 @@ async def _poll_until_done(job_id: str):
                 "estimated_seconds": round(estimated),
                 "rate": round(rate, 1),
                 "domains_done": total_done,
-                "domains_total": total_domains
+                "domains_total": total_domains,
+                "emails_found": total_emails_count,
             }
             await db.update_job(job_id, domains_done=total_done, progress=progress)
 

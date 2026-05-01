@@ -802,6 +802,49 @@ async def list_slaves_endpoint():
     return slaves
 
 
+@app.post("/api/slaves/check-all")
+async def check_all_slaves():
+    """Ping every slave's /api/health right now and update their status in DB."""
+    all_slaves = await db.list_slaves()
+    results = {"online": 0, "offline": 0, "total": len(all_slaves)}
+
+    async def _ping(s: dict):
+        sid = s["id"]
+        url = s.get("url", "")
+        if not url or s.get("status") == "provisioning":
+            return
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                r = await client.get(f"{url}/api/health")
+            data = r.json()
+            now_dt = datetime.now()
+            system_stats = data.get("system_stats", {})
+            update = {"last_seen": now_dt, "system_stats": system_stats}
+            if s.get("status") in ("dead", "offline", "error"):
+                update["status"] = "idle"
+                slaves[sid]["status"] = "idle"
+            slaves[sid] = {**slaves.get(sid, s), **update}
+            await db.update_slave(sid, **update)
+            results["online"] += 1
+        except Exception:
+            results["offline"] += 1
+            elapsed = None
+            last = s.get("last_seen")
+            if last:
+                try:
+                    elapsed = (datetime.now() - datetime.fromisoformat(str(last).replace("Z", "+00:00"))).total_seconds()
+                except Exception:
+                    pass
+            if elapsed is None or elapsed > HEARTBEAT_TIMEOUT:
+                if s.get("status") not in ("offline", "provisioning"):
+                    await db.update_slave(sid, status="offline")
+                    if sid in slaves:
+                        slaves[sid]["status"] = "offline"
+
+    await asyncio.gather(*[_ping(s) for s in all_slaves])
+    return {"ok": True, **results}
+
+
 @app.put("/api/slaves/{slave_id}")
 async def update_slave_endpoint(slave_id: str, data: dict):
     """Update slave settings (name)."""

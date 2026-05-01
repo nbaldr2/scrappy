@@ -678,21 +678,19 @@ async def _heartbeat_monitor():
                     data = r.json()
                     now_dt = datetime.now()
                     system_stats = data.get("system_stats", {})
+                    slave_status = data.get("status", "unknown")
                     
                     # Update in-memory (keep datetime object, not string)
                     slaves[sid]["last_seen"] = now_dt
                     slaves[sid]["system_stats"] = system_stats
+                    slaves[sid]["status"] = slave_status  # Always sync status from slave
 
-                    # Update database
+                    # Update database - include the status from slave
                     update_data = {
                         "last_seen": now_dt,
-                        "system_stats": system_stats
+                        "system_stats": system_stats,
+                        "status": slave_status,
                     }
-                    
-                    # If it was marked dead/error but responded, revive
-                    if s.get("status") in ("dead", "offline", "error"):
-                        slaves[sid]["status"] = "idle"
-                        update_data["status"] = "idle"
                     
                     try:
                         await db.update_slave(sid, **update_data)

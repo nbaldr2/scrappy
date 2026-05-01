@@ -1633,6 +1633,51 @@ async def clear_logs():
     return {"ok": True, "message": "All activity logs cleared"}
 
 
+@app.post("/api/clear-all")
+async def clear_all_data():
+    """Clear ALL data from database: jobs, slaves, emails, logs, and assignments."""
+    import shutil
+    
+    # Get counts before deletion for reporting
+    jobs_count = await db.db.fetch_one("SELECT COUNT(*) FROM jobs")
+    slaves_count = await db.db.fetch_one("SELECT COUNT(*) FROM slaves")
+    emails_count = await db.db.fetch_one("SELECT COUNT(*) FROM emails")
+    logs_count = await db.db.fetch_one("SELECT COUNT(*) FROM activity_logs")
+    
+    # Clear all tables
+    await db.db.execute("DELETE FROM job_assignments")
+    await db.db.execute("DELETE FROM emails")
+    await db.db.execute("DELETE FROM jobs")
+    await db.db.execute("DELETE FROM slaves")
+    await db.db.execute("DELETE FROM activity_logs")
+    
+    # Clear in-memory caches
+    slaves.clear()
+    provision_logs.clear()
+    job_cancel_flags.clear()
+    
+    # Clean up upload and result directories (keep the directories, delete contents)
+    for directory in [UPLOAD_DIR, RESULT_DIR]:
+        if directory.exists():
+            for item in directory.iterdir():
+                try:
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+                except Exception:
+                    pass
+    
+    return {
+        "ok": True,
+        "jobs_deleted": jobs_count[0] if jobs_count else 0,
+        "slaves_deleted": slaves_count[0] if slaves_count else 0,
+        "emails_deleted": emails_count[0] if emails_count else 0,
+        "logs_deleted": logs_count[0] if logs_count else 0,
+        "message": "All data cleared successfully"
+    }
+
+
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)

@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS slaves (
     provision_progress TEXT,
     system_stats JSONB,
     last_seen TIMESTAMP,
+    enabled BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -150,7 +151,28 @@ async def init_database():
     # Insert default settings if not exist
     await _init_default_settings()
     
+    # Migration: Add enabled column to slaves if it doesn't exist
+    await _migrate_add_slave_enabled()
+    
     await log_activity("info", "system", "Database initialized and tables created")
+
+
+async def _migrate_add_slave_enabled():
+    """Migration: Add enabled column to slaves table if not exists."""
+    try:
+        await db.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name='slaves' AND column_name='enabled'
+                ) THEN
+                    ALTER TABLE slaves ADD COLUMN enabled BOOLEAN DEFAULT TRUE;
+                END IF;
+            END $$;
+        """)
+    except Exception as e:
+        print(f"[MIGRATION] Slave enabled column check: {e}")
 
 
 async def close_database():
@@ -422,10 +444,10 @@ async def update_slave(slave_id: str, **fields):
     values = {"id": slave_id}
     
     for key, value in fields.items():
-        if value is not None and key in [
+        if key in [
             "name", "url", "ip", "status", "domains_assigned",
             "domains_done", "emails_found", "provision_progress",
-            "system_stats", "last_seen"
+            "system_stats", "last_seen", "enabled"
         ]:
             set_clauses.append(f"{key} = :{key}")
             if isinstance(value, (dict, list)):

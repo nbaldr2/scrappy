@@ -666,6 +666,8 @@ async def _heartbeat_monitor():
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             for sid, s in list(slaves.items()):
+                # Check health status for all slaves (even disabled ones)
+                # Only skip provisioning slaves
                 if s.get("status") == "provisioning":
                     continue  # Don't ping during provisioning
                 
@@ -823,44 +825,34 @@ async def list_slaves_endpoint():
 
 @app.post("/api/slaves/check-all")
 async def check_all_slaves():
-    """Ping every slave's /api/health right now and update their status in DB."""
+    """Ping every enabled slave's /api/health right now and update their status in DB."""
     all_slaves = await db.list_slaves()
-    results = {"online": 0, "offline": 0, "total": len(all_slaves)}
+    # Filter out disabled slaves
+    enabled_slaves = [s for s in all_slaves if s.get("enabled", True)]
+    results = {"online": 0, "offline": 0, "total": len(enabled_slaves), "skipped": len(all_slaves) - len(enabled_slaves)}
 
     async def _ping(s: dict):
         sid = s["id"]
-        url = s.get("url", "")
-        if not url or s.get("status") == "provisioning":
-            return
         try:
-            async with httpx.AsyncClient(timeout=6.0) as client:
-                r = await client.get(f"{url}/api/health")
-            data = r.json()
-            now_dt = datetime.now()
-            system_stats = data.get("system_stats", {})
-            update = {"last_seen": now_dt, "system_stats": system_stats}
-            if s.get("status") in ("dead", "offline", "error"):
-                update["status"] = "idle"
-                slaves[sid]["status"] = "idle"
-            slaves[sid] = {**slaves.get(sid, s), **update}
-            await db.update_slave(sid, **update)
-            results["online"] += 1
-        except Exception:
-            results["offline"] += 1
-            elapsed = None
-            last = s.get("last_seen")
-            if last:
-                try:
-                    elapsed = (datetime.now() - datetime.fromisoformat(str(last).replace("Z", "+00:00"))).total_seconds()
-                except Exception:
-                    pass
-            if elapsed is None or elapsed > HEARTBEAT_TIMEOUT:
-                if s.get("status") not in ("offline", "provisioning"):
-                    await db.update_slave(sid, status="offline")
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f"{s['url']}/api/health", timeout=10.0)
+                if r.status_code == 200:
+                    data = r.json()
+                    await db.update_slave(sid, status="online", system_stats=data.get("system", {}), last_seen=datetime.utcnow().isoformat())
                     if sid in slaves:
-                        slaves[sid]["status"] = "offline"
+                        slaves[sid].update({"status": "online", "stats": data.get("system", {})})
+                    results["online"] += 1
+                    return
+        except Exception:
+            pass
+        
+        # Mark as offline
+        await db.update_slave(sid, status="offline")
+        if sid in slaves:
+            slaves[sid]["status"] = "offline"
+        results["offline"] += 1
 
-    await asyncio.gather(*[_ping(s) for s in all_slaves])
+    await asyncio.gather(*[_ping(s) for s in enabled_slaves])
     return {"ok": True, **results}
 
 
@@ -877,6 +869,24 @@ async def update_slave_endpoint(slave_id: str, data: dict):
     
     updated = await db.get_slave(slave_id)
     return {"ok": True, "slave": updated}
+
+
+@app.post("/api/slaves/{slave_id}/toggle")
+async def toggle_slave_enabled(slave_id: str):
+    """Toggle slave enabled/disabled status."""
+    slave = await db.get_slave(slave_id)
+    if not slave:
+        raise HTTPException(404, "Slave not found")
+    
+    # Toggle enabled status
+    current_enabled = slave.get("enabled", True)
+    new_enabled = not current_enabled
+    await db.update_slave(slave_id, enabled=new_enabled)
+    
+    status_text = "enabled" if new_enabled else "disabled"
+    await db.log_activity("info", "slaves", f"Slave {slave_id} {status_text}", {"slave_id": slave_id, "enabled": new_enabled})
+    
+    return {"ok": True, "enabled": new_enabled, "message": f"Slave {status_text}"}
 
 
 @app.post("/api/slaves/{slave_id}/reboot")
@@ -1054,8 +1064,8 @@ async def upload_domains(file: UploadFile = File(...), name: str = Form(None)):
 
 @app.post("/api/jobs/{job_id}/start")
 async def start_job(request: Request, job_id: str, workers: int = 12, turbo: bool = True,
-                    dns_on: bool = True):
-    """Clean, DNS filter, split and dispatch to slaves."""
+                    dns_on: bool = False):
+    """Clean, split and dispatch to slaves (DNS filter disabled by default)."""
     job = await db.get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
@@ -1063,10 +1073,11 @@ async def start_job(request: Request, job_id: str, workers: int = 12, turbo: boo
     if job["status"] not in ("uploaded", "failed"):
         raise HTTPException(400, f"Job is {job['status']}")
 
-    # Get active slaves from database
+    # Get active slaves from database (filter out disabled slaves too)
     active_slaves = await db.list_slaves()
     active_slaves = {s["id"]: s for s in active_slaves 
-                     if s.get("status") not in ("dead", "offline", "provisioning", "error")}
+                     if s.get("status") not in ("dead", "offline", "provisioning", "error")
+                     and s.get("enabled", True) is not False}
     
     if not active_slaves:
         raise HTTPException(400, "No active slaves available — provision or check connections")
@@ -1141,11 +1152,16 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool, master_
             await db.update_job(job_id, status="completed", finished_at=datetime.now())
             return
 
-        # 4. Split across active slaves
+        # 4. Split across active slaves (exclude disabled)
         slaves_list = await db.list_slaves()
         active = {s["id"]: s for s in slaves_list
-                  if s.get("status") not in ("dead", "offline", "provisioning", "error")}
+                  if s.get("status") not in ("dead", "offline", "provisioning", "error")
+                  and s.get("enabled", True) is not False}
         slave_ids = list(active.keys())
+        enabled_count = len([s for s in slaves_list if s.get("enabled", True) is not False])
+        disabled_count = len(slaves_list) - enabled_count
+        if disabled_count > 0:
+            print(f"[JOB {job_id}] Skipping {disabled_count} disabled slaves, using {len(slave_ids)} enabled slaves")
         
         if not slave_ids:
             await db.update_job(job_id, status="failed", error="No active slaves available")
@@ -1575,10 +1591,15 @@ async def resume_job(request: Request, job_id: str, workers: int = 12, turbo: bo
     
     print(f"[RESUME] Job {job_id}: {len(remaining_domains)} domains to resume")
     
-    # Get currently active slaves
+    # Get currently active slaves (exclude disabled)
     slaves_list = await db.list_slaves()
     active = {s["id"]: s for s in slaves_list
-              if s.get("status") not in ("dead", "offline", "provisioning", "error")}
+              if s.get("status") not in ("dead", "offline", "provisioning", "error")
+              and s.get("enabled", True) is not False}
+    
+    disabled_count = len([s for s in slaves_list if s.get("enabled", True) is False])
+    if disabled_count > 0:
+        print(f"[RESUME] Skipping {disabled_count} disabled slaves")
     
     if not active:
         raise HTTPException(400, "No active slaves available — bring slaves online first")
@@ -1728,10 +1749,15 @@ async def retry_incomplete_job(request: Request, job_id: str, workers: int = 12,
 
     print(f"[RETRY] Job {job_id}: {len(unfinished_domains)} unfinished domains to reassign")
 
-    # Get currently active slaves
+    # Get currently active slaves (exclude disabled)
     slaves_list = await db.list_slaves()
     active = {s["id"]: s for s in slaves_list
-              if s.get("status") not in ("dead", "offline", "provisioning", "error")}
+              if s.get("status") not in ("dead", "offline", "provisioning", "error")
+              and s.get("enabled", True) is not False}
+    
+    disabled_count = len([s for s in slaves_list if s.get("enabled", True) is False])
+    if disabled_count > 0:
+        print(f"[RETRY] Skipping {disabled_count} disabled slaves")
     
     if not active:
         raise HTTPException(400, "No active slaves available — bring slaves online first")
@@ -1791,15 +1817,24 @@ async def retry_incomplete_job(request: Request, job_id: str, workers: int = 12,
 @app.delete("/api/jobs/{job_id}")
 async def delete_job_endpoint(job_id: str):
     """Delete a job and all associated data."""
-    deleted = await db.delete_job(job_id)
-    if deleted:
-        # Also delete result file if exists
-        # Delete job directory and all files
-        for d in [UPLOAD_DIR / job_id, RESULT_DIR / job_id]:
-            if d.exists():
-                shutil.rmtree(d)
-        return {"ok": True, "message": "Job deleted"}
-    raise HTTPException(404, "Job not found")
+    try:
+        deleted = await db.delete_job(job_id)
+        if deleted:
+            # Also delete result file if exists
+            # Delete job directory and all files
+            for d in [UPLOAD_DIR / job_id, RESULT_DIR / job_id]:
+                if d.exists():
+                    try:
+                        shutil.rmtree(d)
+                    except Exception as e:
+                        print(f"[DELETE] Warning: Could not delete directory {d}: {e}")
+            return {"ok": True, "message": "Job deleted"}
+        raise HTTPException(404, "Job not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[DELETE] Error deleting job {job_id}: {e}")
+        raise HTTPException(500, f"Delete failed: {str(e)}")
 
 
 async def _notify_slaves_cancel(job_id: str):

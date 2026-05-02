@@ -31,6 +31,7 @@
     <div class="section-header">
       <h2><span class="icon">🖥️</span> Slave Workers</h2>
       <button class="btn btn-ghost btn-sm" id="checkAllBtn" onclick="checkAllSlaves()">⚡ Check All</button>
+      <button class="btn btn-secondary btn-sm" onclick="toggleAllSlaves()">🔄 Toggle All</button>
       <button class="btn btn-warning btn-sm" onclick="restartAllServices()">🔄 Restart All</button>
       <button class="btn btn-secondary btn-sm" onclick="pauseAllSlaves()">⏸️ Pause All</button>
       <button class="btn btn-success btn-sm" onclick="resumeAllSlaves()">▶️ Resume All</button>
@@ -119,7 +120,6 @@
       <div class="form-group"><label>Workers per Slave</label><input type="number" class="form-input" id="cfgWorkers" value="12" min="1" max="30"></div>
       <div class="form-group"><label>Speed Mode</label><select class="form-input" id="cfgTurbo"><option value="true" selected>⚡ Turbo</option><option value="false">🐢 Standard</option></select></div>
     </div>
-    <div class="form-group"><label>DNS Pre-Filter</label><select class="form-input" id="cfgDns"><option value="true" selected>Yes — skip dead domains</option><option value="false">No — scrape all</option></select></div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeJobConfig()">Cancel</button>
       <button class="btn btn-success" onclick="launchJob()">🚀 Launch</button>
@@ -150,6 +150,7 @@
       <div class="form-group"><label>Status</label><input type="text" class="form-input" id="slaveSettingsStatus" readonly style="background:var(--bg-secondary)"></div>
       <div class="form-group"><label>IP Address</label><input type="text" class="form-input" id="slaveSettingsIP" readonly style="background:var(--bg-secondary)"></div>
       <div class="form-group"><label>Last Seen</label><input type="text" class="form-input" id="slaveSettingsLastSeen" readonly style="background:var(--bg-secondary)"></div>
+      <div class="form-group"><label>Enabled</label><input type="text" class="form-input" id="slaveSettingsEnabled" readonly style="background:var(--bg-secondary)"></div>
     </div>
     
     <h4 style="margin:16px 0 8px;font-size:0.95rem">📊 System Stats</h4>
@@ -292,6 +293,10 @@ function openSlaveSettings(id) {
     document.getElementById('slaveSettingsIP').value = s.ip || '';
     document.getElementById('slaveSettingsLastSeen').value = timeSince(s.last_seen);
     
+    // Show enabled status
+    const enabled = s.enabled !== false;
+    document.getElementById('slaveSettingsEnabled').value = enabled ? 'Enabled' : 'Disabled';
+    
     const ss = s.system_stats || {};
     document.getElementById('slaveStatsCPU').textContent = ss.cpu_load_1m !== undefined ? ss.cpu_load_1m.toFixed(1) : '—';
     document.getElementById('slaveStatsRAM').textContent = ss.ram_percent !== undefined ? `${ss.ram_percent}%` : '—';
@@ -408,7 +413,7 @@ async function removeSlave(id){if(!confirm('Remove this slave?'))return;await fe
 async function refreshSlaves(){
   try{
     const r=await fetch('/api/slaves');const slaves=await r.json();slaves.sort((a,b)=>(a.id||'').localeCompare(b.id||''));
-    document.getElementById('statSlaves').textContent=slaves.filter(s=>!['dead','offline','error'].includes(s.status)).length;
+    document.getElementById('statSlaves').textContent=slaves.filter(s=>!['dead','offline','error'].includes(s.status)&&s.enabled!==false).length;
     if(!slaves.length){document.getElementById('slavesEmpty').style.display='';document.getElementById('slavesTable').style.display='none';return}
     document.getElementById('slavesEmpty').style.display='none';document.getElementById('slavesTable').style.display='';
     document.getElementById('slavesBody').innerHTML=slaves.map(s=>{
@@ -418,6 +423,10 @@ async function refreshSlaves(){
       const disk=ss.disk_percent!==undefined?`${ss.disk_percent}%`:'—';
       const statusCls=s.status==='provisioning'?'processing':s.status;
       const provBadge=s.status==='provisioning'?` <span class="spinner" style="margin-left:4px"></span>`:'';
+      const enabled=s.enabled!==false;
+      const toggleBtn=enabled?
+        `<button class="btn btn-success btn-sm" onclick="toggleSlave('${s.id}')" title="Enabled - Click to disable">🟢</button>`:
+        `<button class="btn btn-ghost btn-sm" onclick="toggleSlave('${s.id}')" title="Disabled - Click to enable" style="opacity:0.5">⚪</button>`;
       return`<tr>
         <td><a href="#" onclick="openSlaveSettings('${s.id}');return false" style="color:var(--accent-primary);text-decoration:none"><strong>${esc(s.name)}</strong></a></td>
         <td><code style="font-size:0.75rem;color:var(--text-muted)">${esc(s.ip||'')} · :${esc(s.url.split(':').pop())}</code></td>
@@ -428,9 +437,23 @@ async function refreshSlaves(){
         <td>${s.domains_assigned}</td><td>${s.domains_done}</td>
         <td style="color:var(--success);font-weight:600">${s.emails_found}</td>
         <td style="font-size:0.75rem;color:var(--text-muted)">${timeSince(s.last_seen)}</td>
-        <td><button class="btn btn-ghost btn-sm" onclick="openSlaveSettings('${s.id}')" title="Settings">⚙️</button> <button class="btn btn-danger btn-sm" onclick="removeSlave('${s.id}')" title="Remove">✕</button></td>
+        <td>${toggleBtn} <button class="btn btn-ghost btn-sm" onclick="openSlaveSettings('${s.id}')" title="Settings">⚙️</button> <button class="btn btn-danger btn-sm" onclick="removeSlave('${s.id}')" title="Remove">✕</button></td>
       </tr>`}).join('');
   }catch{}
+}
+
+// ── Toggle Slave Enabled ──
+async function toggleSlave(id){
+  try{
+    const r=await fetch(`/api/slaves/${id}/toggle`,{method:'POST'});
+    const d=await r.json();
+    if(d.ok){
+      toast(d.message,'info');
+      refreshSlaves();
+    }else{
+      toast(d.detail||'Toggle failed','error');
+    }
+  }catch(e){toast('Toggle failed','error');}
 }
 
 // ── Upload ──
@@ -456,9 +479,9 @@ function openJobConfig(id){document.getElementById('jobIdToStart').value=id;docu
 function closeJobConfig(){document.getElementById('jobConfigModal').classList.remove('active')}
 async function launchJob(){
   const id=document.getElementById('jobIdToStart').value,w=parseInt(document.getElementById('cfgWorkers').value)||12,
-    t=document.getElementById('cfgTurbo').value==='true',d=document.getElementById('cfgDns').value==='true';
+    t=document.getElementById('cfgTurbo').value==='true';
   closeJobConfig();
-  try{const r=await fetch(`/api/jobs/${id}/start?workers=${w}&turbo=${t}&dns_on=${d}`,{method:'POST'});const data=await r.json();
+  try{const r=await fetch(`/api/jobs/${id}/start?workers=${w}&turbo=${t}&dns_on=false`,{method:'POST'});const data=await r.json();
     if(data.ok){toast('Job launched!','success');addLog(`Job ${id} launched`,'log-success');refreshJobs()}
     else{toast(data.detail||'Failed','error');addLog(`Launch failed: ${data.detail}`,'log-error')}}
   catch(e){toast('Failed','error')}
@@ -496,7 +519,7 @@ async function refreshJobs(){
     if(!jobs.length){document.getElementById('jobsEmpty').style.display='';document.getElementById('jobsList').innerHTML='';document.getElementById('jobsPagination').style.display='none';return}
     document.getElementById('jobsEmpty').style.display='none';
     document.getElementById('jobsList').innerHTML=jobs.map(j=>{
-      const isActive=['cleaning','dns_filtering','scraping','processing'].includes(j.status),isDone=j.status==='completed',isCancellable=isActive,isDeletable=['cancelled','failed','completed'].includes(j.status),isRetryable=['failed','completed'].includes(j.status)&&j.domains_done<j.domains_live,isPausable=isActive,isPaused=j.status==='paused';
+      const isActive=['cleaning','dns_filtering','scraping','processing'].includes(j.status),isDone=j.status==='completed',isCancellable=isActive,isDeletable=['uploaded','cancelled','failed','completed'].includes(j.status),isRetryable=['failed','completed'].includes(j.status)&&j.domains_done<j.domains_live,isPausable=isActive,isPaused=j.status==='paused';
       // DNS progress indicator
       let dnsProgress='';
       if(j.status==='dns_filtering'&&j.dns_progress){const p=j.dns_progress;dnsProgress=`<div style="margin-top:8px;font-size:0.78rem;color:var(--accent-primary)">🔍 DNS Check: ${p.checked.toLocaleString()}/${p.total.toLocaleString()} (${Math.round(p.checked/p.total*100)}%)</div>`}
@@ -530,7 +553,7 @@ async function refreshJobs(){
             ${isPausable?`<button class="btn btn-warning btn-sm" onclick="pauseJob('${j.id}')">⏸️ Pause</button>`:''}
             ${isCancellable?`<button class="btn btn-danger btn-sm" onclick="cancelJob('${j.id}')">✕ Cancel</button>`:''}
             ${isRetryable?`<button class="btn btn-success btn-sm" onclick="retryJob('${j.id}')">🔄 Retry Incomplete</button>`:''}
-            ${isDeletable?`<button class="btn btn-danger btn-sm" onclick="deleteJob('${j.id}')">🗑️ Delete</button>`:''}
+            ${isDeletable?`<button class="btn btn-danger btn-sm" onclick="deleteJob('${j.id}')" title="Delete">🗑️</button>`:''}
             ${j.emails_count?`<a href="/api/jobs/${j.id}/download" class="btn btn-primary btn-sm">📥 Download (${j.emails_count})${isDone?'':` · partial ${j.progress?j.progress.percent+'%':''}`}</a>`:''}
             <button class="btn btn-ghost btn-sm" onclick="openRenameModal('${j.id}','${esc(j.name||'')}')" title="Rename">✏️</button>
           </div>
@@ -613,7 +636,7 @@ async function restartAllServices() {
   try {
     const r = await fetch('/api/slaves');
     const slaves = await r.json();
-    const onlineSlaves = slaves.filter(s => s.status === 'idle' || s.status === 'scraping');
+    const onlineSlaves = slaves.filter(s => (s.status === 'idle' || s.status === 'scraping') && s.enabled !== false);
     
     if (onlineSlaves.length === 0) {
       toast('No online slaves to restart', 'info');
@@ -649,7 +672,7 @@ async function pauseAllSlaves() {
   try {
     const r = await fetch('/api/slaves');
     const slaves = await r.json();
-    const activeSlaves = slaves.filter(s => s.status === 'idle' || s.status === 'scraping');
+    const activeSlaves = slaves.filter(s => (s.status === 'idle' || s.status === 'scraping') && s.enabled !== false);
     
     if (activeSlaves.length === 0) {
       toast('No active slaves to pause', 'info');
@@ -683,7 +706,7 @@ async function resumeAllSlaves() {
   try {
     const r = await fetch('/api/slaves');
     const slaves = await r.json();
-    const pausedSlaves = slaves.filter(s => s.status === 'paused');
+    const pausedSlaves = slaves.filter(s => s.status === 'paused' && s.enabled !== false);
     
     if (pausedSlaves.length === 0) {
       toast('No paused slaves to resume', 'info');
@@ -709,6 +732,58 @@ async function resumeAllSlaves() {
     refreshSlaves();
   } catch (e) {
     toast('Failed to resume slaves', 'error');
+  }
+}
+
+// ── Toggle All Slaves ──
+async function toggleAllSlaves() {
+  const action = confirm('Toggle ALL slaves?\n\nOK = Disable all slaves\nCancel = Enable all slaves');
+  const enableAll = !action; // Cancel = enable, OK = disable
+  
+  try {
+    const r = await fetch('/api/slaves');
+    const slaves = await r.json();
+    
+    if (enableAll) {
+      const disabledSlaves = slaves.filter(s => s.enabled === false);
+      if (disabledSlaves.length === 0) {
+        toast('No disabled slaves to enable', 'info');
+        return;
+      }
+      toast(`Enabling ${disabledSlaves.length} slaves...`, 'info');
+      let success = 0, failed = 0;
+      for (const s of disabledSlaves) {
+        try {
+          const r2 = await fetch(`/api/slaves/${s.id}/toggle`, { method: 'POST' });
+          const d2 = await r2.json();
+          if (d2.ok) success++;
+          else failed++;
+        } catch (e) { failed++; }
+      }
+      toast(`${success} enabled, ${failed} failed`, failed > 0 ? 'warning' : 'success');
+      addLog(`Enabled slaves: ${success} success, ${failed} failed`, failed > 0 ? 'log-warning' : 'log-success');
+    } else {
+      const enabledSlaves = slaves.filter(s => s.enabled !== false);
+      if (enabledSlaves.length === 0) {
+        toast('No enabled slaves to disable', 'info');
+        return;
+      }
+      toast(`Disabling ${enabledSlaves.length} slaves...`, 'info');
+      let success = 0, failed = 0;
+      for (const s of enabledSlaves) {
+        try {
+          const r2 = await fetch(`/api/slaves/${s.id}/toggle`, { method: 'POST' });
+          const d2 = await r2.json();
+          if (d2.ok) success++;
+          else failed++;
+        } catch (e) { failed++; }
+      }
+      toast(`${success} disabled, ${failed} failed`, failed > 0 ? 'warning' : 'success');
+      addLog(`Disabled slaves: ${success} success, ${failed} failed`, failed > 0 ? 'log-warning' : 'log-success');
+    }
+    refreshSlaves();
+  } catch (e) {
+    toast('Failed to toggle slaves', 'error');
   }
 }
 

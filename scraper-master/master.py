@@ -1053,9 +1053,8 @@ async def upload_domains(file: UploadFile = File(...), name: str = Form(None)):
 
 
 @app.post("/api/jobs/{job_id}/start")
-async def start_job(request: Request, job_id: str, workers: int = 12, turbo: bool = True,
-                    dns_on: bool = True):
-    """Clean, DNS filter, split and dispatch to slaves."""
+async def start_job(request: Request, job_id: str, workers: int = 12, turbo: bool = True):
+    """Clean domains, split and dispatch to slaves."""
     job = await db.get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
@@ -1075,11 +1074,11 @@ async def start_job(request: Request, job_id: str, workers: int = 12, turbo: boo
 
     master_url = str(request.base_url).rstrip("/")
 
-    asyncio.create_task(_run_job(job_id, workers, turbo, dns_on, master_url))
+    asyncio.create_task(_run_job(job_id, workers, turbo, master_url))
     return {"ok": True, "status": "processing"}
 
 
-async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool, master_url: str):
+async def _run_job(job_id: str, workers: int, turbo: bool, master_url: str):
     job = await db.get_job(job_id)
     if not job:
         print(f"[ERROR] Job {job_id} not found in database")
@@ -1122,19 +1121,10 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool, master_
         print(f"[JOB {job_id}] Cleaning domains...")
         cleaned, cstats = clean_domains(raw_lines, phase2=True)
         print(f"[JOB {job_id}] Cleaned: {len(cleaned)} domains. Stats: {cstats}")
-        await db.update_job(job_id, domains_cleaned=len(cleaned), clean_stats=cstats)
+        await db.update_job(job_id, domains_cleaned=len(cleaned), clean_stats=cstats, domains_live=len(cleaned), live_domains=cleaned)
 
-        # 3. DNS filter
+        # Use cleaned domains directly (no DNS filter)
         live = cleaned
-        if dns_on and cleaned:
-            await db.update_job(job_id, status="dns_filtering")
-            print(f"[JOB {job_id}] Starting DNS filtering on {len(cleaned)} domains...")
-            live, dead = await dns_filter_async(cleaned, job_id)
-            print(f"[JOB {job_id}] DNS filtering complete: {len(live)} live, {dead} dead")
-            await db.update_job(job_id, domains_live=len(live), dns_stats={"alive": len(live), "dead": dead}, live_domains=live)
-        else:
-            print(f"[JOB {job_id}] Skipping DNS filter (dns_on={dns_on})")
-            await db.update_job(job_id, domains_live=len(live), live_domains=live)
 
         if not live:
             print(f"[JOB {job_id}] No live domains, completing job")
@@ -1553,18 +1543,13 @@ async def resume_job(request: Request, job_id: str, workers: int = 12, turbo: bo
                 print(f"[RESUME] Loading domains from file, skipping first {domains_done} already processed...")
                 raw_lines = Path(file_path).read_text(encoding="utf-8").splitlines()
                 cleaned, _ = clean_domains(raw_lines, phase2=True)
-                dns_stats = job.get("dns_stats") or {}
-                if dns_stats.get("alive") is not None:
-                    live, _ = await dns_filter_async(cleaned, job_id)
-                else:
-                    live = cleaned
                 
                 # Skip domains that were already processed
-                if domains_done > 0 and domains_done < len(live):
-                    remaining_domains = live[domains_done:]
+                if domains_done > 0 and domains_done < len(cleaned):
+                    remaining_domains = cleaned[domains_done:]
                     print(f"[RESUME] Resuming from domain {domains_done}, {len(remaining_domains)} remaining")
                 else:
-                    remaining_domains = live
+                    remaining_domains = cleaned
             except Exception as e:
                 raise HTTPException(400, f"Could not load domains from file: {e}")
         else:

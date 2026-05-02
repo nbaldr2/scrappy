@@ -30,7 +30,12 @@
   <section class="section fade-in">
     <div class="section-header">
       <h2><span class="icon">🖥️</span> Slave Workers</h2>
+      <button class="btn btn-ghost btn-sm" id="checkAllBtn" onclick="checkAllSlaves()">⚡ Check All</button>
+      <button class="btn btn-warning btn-sm" onclick="restartAllServices()">🔄 Restart All</button>
+      <button class="btn btn-secondary btn-sm" onclick="pauseAllSlaves()">⏸️ Pause All</button>
+      <button class="btn btn-success btn-sm" onclick="resumeAllSlaves()">▶️ Resume All</button>
       <button class="btn btn-primary btn-sm" onclick="openProvisionModal()">+ Add Slave VPS</button>
+      <button class="btn btn-danger btn-sm" onclick="clearAllData()">🗑️ Clear All Data</button>
     </div>
     <div id="slavesEmpty" class="empty-state">
       <div class="icon">🔌</div><div class="title">No slaves registered</div>
@@ -462,6 +467,12 @@ async function launchJob(){
 // ── Cancel Job ──
 async function cancelJob(id){if(!confirm('Cancel this job?'))return;try{const r=await fetch(`/api/jobs/${id}/cancel`,{method:'POST'});const d=await r.json();if(d.ok){toast('Job cancelled','info');addLog(`Job ${id} cancelled`,'log-info');refreshJobs()}}catch(e){toast('Cancel failed','error')}}
 
+// ── Pause Job ──
+async function pauseJob(id){if(!confirm('Pause this job? Progress will be saved and you can resume later.'))return;try{const r=await fetch(`/api/jobs/${id}/pause`,{method:'POST'});const d=await r.json();if(d.ok){toast(`Job paused: ${d.remaining_domains} domains saved`,'info');addLog(`Job ${id} paused with ${d.remaining_domains} remaining`,'log-info');refreshJobs()}else{toast(d.detail||'Pause failed','error')}}catch(e){toast('Pause failed','error')}}
+
+// ── Resume Job ──
+async function resumeJob(id){try{const r=await fetch(`/api/jobs/${id}/resume`,{method:'POST'});const d=await r.json();if(d.ok){toast(`Job resumed: ${d.domains_resumed} domains → ${d.slaves_used} slaves`,'success');addLog(`Job ${id} resumed: ${d.domains_resumed} domains`,'log-success');refreshJobs()}else{toast(d.detail||'Resume failed','error')}}catch(e){toast('Resume failed','error')}}
+
 // ── Delete Job ──
 async function deleteJob(id){if(!confirm('Delete this job permanently? This cannot be undone.'))return;try{const r=await fetch(`/api/jobs/${id}`,{method:'DELETE'});const d=await r.json();if(d.ok){toast('Job deleted','info');addLog(`Job ${id} deleted`,'log-info');refreshJobs()}}catch(e){toast('Delete failed','error')}}
 
@@ -485,7 +496,7 @@ async function refreshJobs(){
     if(!jobs.length){document.getElementById('jobsEmpty').style.display='';document.getElementById('jobsList').innerHTML='';document.getElementById('jobsPagination').style.display='none';return}
     document.getElementById('jobsEmpty').style.display='none';
     document.getElementById('jobsList').innerHTML=jobs.map(j=>{
-      const isActive=['cleaning','dns_filtering','scraping','processing'].includes(j.status),isDone=j.status==='completed',isCancellable=isActive,isDeletable=['cancelled','failed','completed'].includes(j.status),isRetryable=['failed','completed'].includes(j.status)&&j.domains_done<j.domains_live;
+      const isActive=['cleaning','dns_filtering','scraping','processing'].includes(j.status),isDone=j.status==='completed',isCancellable=isActive,isDeletable=['cancelled','failed','completed'].includes(j.status),isRetryable=['failed','completed'].includes(j.status)&&j.domains_done<j.domains_live,isPausable=isActive,isPaused=j.status==='paused';
       // DNS progress indicator
       let dnsProgress='';
       if(j.status==='dns_filtering'&&j.dns_progress){const p=j.dns_progress;dnsProgress=`<div style="margin-top:8px;font-size:0.78rem;color:var(--accent-primary)">🔍 DNS Check: ${p.checked.toLocaleString()}/${p.total.toLocaleString()} (${Math.round(p.checked/p.total*100)}%)</div>`}
@@ -515,10 +526,12 @@ async function refreshJobs(){
           </div>
           <div style="display:flex;gap:8px">
             ${j.status==='uploaded'?`<button class="btn btn-success btn-sm" onclick="openJobConfig('${j.id}')">🚀 Launch</button>`:''}
+            ${isPaused?`<button class="btn btn-success btn-sm" onclick="resumeJob('${j.id}')">▶️ Resume</button>`:''}
+            ${isPausable?`<button class="btn btn-warning btn-sm" onclick="pauseJob('${j.id}')">⏸️ Pause</button>`:''}
             ${isCancellable?`<button class="btn btn-danger btn-sm" onclick="cancelJob('${j.id}')">✕ Cancel</button>`:''}
             ${isRetryable?`<button class="btn btn-success btn-sm" onclick="retryJob('${j.id}')">🔄 Retry Incomplete</button>`:''}
             ${isDeletable?`<button class="btn btn-danger btn-sm" onclick="deleteJob('${j.id}')">🗑️ Delete</button>`:''}
-            ${isDone&&j.emails_count?`<a href="/api/jobs/${j.id}/download" class="btn btn-primary btn-sm">📥 Download (${j.emails_count})</a>`:''}
+            ${j.emails_count?`<a href="/api/jobs/${j.id}/download" class="btn btn-primary btn-sm">📥 Download (${j.emails_count})${isDone?'':` · partial ${j.progress?j.progress.percent+'%':''}`}</a>`:''}
             <button class="btn btn-ghost btn-sm" onclick="openRenameModal('${j.id}','${esc(j.name||'')}')" title="Rename">✏️</button>
           </div>
         </div>
@@ -549,6 +562,155 @@ function formatDuration(seconds) {
 }
 
 function goToPage(p){currentPage=p;refreshJobs()}
+
+// ── Check All Slaves ──
+async function checkAllSlaves() {
+  const btn = document.getElementById('checkAllBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await fetch('/api/slaves/check-all', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      toast(`${d.online} online · ${d.offline} offline`, d.offline > 0 ? 'info' : 'success');
+      addLog(`Slave check: ${d.online}/${d.total} online`, d.offline > 0 ? 'log-info' : 'log-success');
+      refreshSlaves();
+    }
+  } catch (e) {
+    toast('Check failed', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '⚡ Check All';
+  }
+}
+
+// ── Clear All Data ──
+async function clearAllData() {
+  if (!confirm('⚠️ WARNING: This will delete ALL jobs, slaves, emails, and logs from the database.\n\nThis action cannot be undone.\n\nAre you sure?')) return;
+  if (!confirm('Second confirmation: Really delete everything?')) return;
+  
+  try {
+    const r = await fetch('/api/clear-all', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      toast(`Cleared: ${d.jobs_deleted} jobs, ${d.slaves_deleted} slaves, ${d.emails_deleted} emails`, 'success');
+      addLog(`Database cleared: ${d.jobs_deleted} jobs, ${d.slaves_deleted} slaves, ${d.emails_deleted} emails, ${d.logs_deleted} logs`, 'log-success');
+      refreshSlaves();
+      refreshJobs();
+      loadLogsFromDB();
+    } else {
+      toast(d.detail || 'Clear failed', 'error');
+    }
+  } catch (e) {
+    toast('Clear failed: ' + e.message, 'error');
+  }
+}
+
+// ── Restart All Services ──
+async function restartAllServices() {
+  if (!confirm('Restart scraper-slave service on ALL online slaves?')) return;
+  
+  try {
+    const r = await fetch('/api/slaves');
+    const slaves = await r.json();
+    const onlineSlaves = slaves.filter(s => s.status === 'idle' || s.status === 'scraping');
+    
+    if (onlineSlaves.length === 0) {
+      toast('No online slaves to restart', 'info');
+      return;
+    }
+    
+    toast(`Restarting services on ${onlineSlaves.length} slaves...`, 'info');
+    
+    let success = 0, failed = 0;
+    for (const s of onlineSlaves) {
+      try {
+        const r2 = await fetch(`/api/slaves/${s.id}/restart-service`, { method: 'POST' });
+        const d2 = await r2.json();
+        if (d2.ok) success++;
+        else failed++;
+      } catch (e) {
+        failed++;
+      }
+    }
+    
+    toast(`${success} restarted, ${failed} failed`, failed > 0 ? 'warning' : 'success');
+    addLog(`Restarted services: ${success} success, ${failed} failed`, failed > 0 ? 'log-warning' : 'log-success');
+    setTimeout(refreshSlaves, 3000);
+  } catch (e) {
+    toast('Failed to restart services', 'error');
+  }
+}
+
+// ── Pause All Slaves ──
+async function pauseAllSlaves() {
+  if (!confirm('Pause ALL slaves? They will stop processing jobs.')) return;
+  
+  try {
+    const r = await fetch('/api/slaves');
+    const slaves = await r.json();
+    const activeSlaves = slaves.filter(s => s.status === 'idle' || s.status === 'scraping');
+    
+    if (activeSlaves.length === 0) {
+      toast('No active slaves to pause', 'info');
+      return;
+    }
+    
+    toast(`Pausing ${activeSlaves.length} slaves...`, 'info');
+    
+    let success = 0, failed = 0;
+    for (const s of activeSlaves) {
+      try {
+        const r2 = await fetch(`/api/slaves/${s.id}/pause`, { method: 'POST' });
+        const d2 = await r2.json();
+        if (d2.ok) success++;
+        else failed++;
+      } catch (e) {
+        failed++;
+      }
+    }
+    
+    toast(`${success} paused, ${failed} failed`, failed > 0 ? 'warning' : 'success');
+    addLog(`Paused slaves: ${success} success, ${failed} failed`, failed > 0 ? 'log-warning' : 'log-success');
+    refreshSlaves();
+  } catch (e) {
+    toast('Failed to pause slaves', 'error');
+  }
+}
+
+// ── Resume All Slaves ──
+async function resumeAllSlaves() {
+  try {
+    const r = await fetch('/api/slaves');
+    const slaves = await r.json();
+    const pausedSlaves = slaves.filter(s => s.status === 'paused');
+    
+    if (pausedSlaves.length === 0) {
+      toast('No paused slaves to resume', 'info');
+      return;
+    }
+    
+    toast(`Resuming ${pausedSlaves.length} slaves...`, 'info');
+    
+    let success = 0, failed = 0;
+    for (const s of pausedSlaves) {
+      try {
+        const r2 = await fetch(`/api/slaves/${s.id}/resume`, { method: 'POST' });
+        const d2 = await r2.json();
+        if (d2.ok) success++;
+        else failed++;
+      } catch (e) {
+        failed++;
+      }
+    }
+    
+    toast(`${success} resumed, ${failed} failed`, failed > 0 ? 'warning' : 'success');
+    addLog(`Resumed slaves: ${success} success, ${failed} failed`, failed > 0 ? 'log-warning' : 'log-success');
+    refreshSlaves();
+  } catch (e) {
+    toast('Failed to resume slaves', 'error');
+  }
+}
 
 // Initialize
 loadLogsFromDB();

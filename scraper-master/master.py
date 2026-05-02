@@ -624,8 +624,8 @@ def _exec(ssh: paramiko.SSHClient, cmd: str, timeout: int = 30, check: bool = Fa
 
 # ── Slave Heartbeat Monitor ───────────────────────────────────────────────────
 
-HEARTBEAT_INTERVAL = 15   # seconds between health checks
-HEARTBEAT_TIMEOUT  = 45   # mark dead after this many seconds without response
+HEARTBEAT_INTERVAL = 30   # seconds between health checks (was 15)
+HEARTBEAT_TIMEOUT  = 120  # mark offline after 2 min without response (was 45)
 _monitor_task = None
 
 
@@ -664,7 +664,7 @@ async def _heartbeat_monitor():
         if not slaves:
             continue
 
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             for sid, s in list(slaves.items()):
                 if s.get("status") == "provisioning":
                     continue  # Don't ping during provisioning
@@ -691,11 +691,13 @@ async def _heartbeat_monitor():
                         "system_stats": system_stats,
                     }
                     
-                    # If marked offline/error but responding now, revive to "idle"
+                    # If marked offline/error/rebooting but responding now, revive to "idle"
                     current_status = slaves[sid].get("status")
-                    if current_status in ("offline", "error"):
+                    if current_status in ("offline", "error", "rebooting"):
                         slaves[sid]["status"] = "idle"
                         update_data["status"] = "idle"
+                        if current_status == "rebooting":
+                            print(f"[HEARTBEAT] Slave {sid} back online after reboot")
                     
                     try:
                         await db.update_slave(sid, **update_data)
@@ -710,9 +712,21 @@ async def _heartbeat_monitor():
                     else:
                         elapsed = (datetime.now() - last).total_seconds()
 
-                    if elapsed > HEARTBEAT_TIMEOUT:
-                        if s.get("status") != "offline":
+                    # Give rebooting slaves more time (2x timeout) to come back
+                    is_rebooting = s.get("status") == "rebooting"
+                    timeout_threshold = HEARTBEAT_TIMEOUT * 2 if is_rebooting else HEARTBEAT_TIMEOUT
+
+                    if elapsed > timeout_threshold:
+                        if s.get("status") not in ("offline", "rebooting"):
                             print(f"[HEARTBEAT] Slave {sid} marked offline (no response for {int(elapsed)}s)")
+                            slaves[sid]["status"] = "offline"
+                            try:
+                                await db.update_slave(sid, status="offline")
+                            except Exception:
+                                pass
+                        elif is_rebooting and elapsed > HEARTBEAT_TIMEOUT * 3:
+                            # If rebooting for too long (6 min), mark as offline
+                            print(f"[HEARTBEAT] Slave {sid} reboot took too long, marking offline")
                             slaves[sid]["status"] = "offline"
                             try:
                                 await db.update_slave(sid, status="offline")
@@ -867,7 +881,7 @@ async def update_slave_endpoint(slave_id: str, data: dict):
 
 @app.post("/api/slaves/{slave_id}/reboot")
 async def reboot_slave(slave_id: str):
-    """Reboot the slave VPS."""
+    """Reboot the slave VPS via API call."""
     slave = await db.get_slave(slave_id)
     if not slave:
         raise HTTPException(404, "Slave not found")
@@ -875,22 +889,24 @@ async def reboot_slave(slave_id: str):
     slave_url = slave.get("url", "")
     ip = slave.get("ip", "")
     
-    # Try system reboot endpoint first
+    if not slave_url:
+        raise HTTPException(400, "Slave has no URL configured")
+    
+    # Try system reboot endpoint
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(f"{slave_url}/api/system/reboot")
-            if r.status_code == 200:
+            data = r.json()
+            if r.status_code == 200 and data.get("ok"):
                 await db.update_slave(slave_id, status="rebooting")
-                return {"ok": True, "message": "Reboot initiated"}
-    except Exception:
-        pass
-    
-    # Fallback: Manual reboot required
-    if ip:
-        await db.update_slave(slave_id, status="offline")
-        return {"ok": True, "message": "Manual reboot required - SSH credentials not stored"}
-    
-    return {"ok": False, "message": "Could not reboot slave"}
+                # Update in-memory cache too
+                if slave_id in slaves:
+                    slaves[slave_id]["status"] = "rebooting"
+                return {"ok": True, "message": "Reboot initiated - slave will restart automatically"}
+            else:
+                return {"ok": False, "message": f"Reboot failed: {data.get('message', 'Unknown error')}"}
+    except Exception as e:
+        return {"ok": False, "message": f"Could not reach slave: {str(e)[:100]}"}
 
 
 @app.post("/api/slaves/{slave_id}/restart-service")
@@ -901,16 +917,20 @@ async def restart_slave_service(slave_id: str):
         raise HTTPException(404, "Slave not found")
     
     slave_url = slave.get("url", "")
+    if not slave_url:
+        raise HTTPException(400, "Slave has no URL configured")
     
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.post(f"{slave_url}/api/system/restart-service")
-            if r.status_code == 200:
-                return {"ok": True, "message": "Service restarted"}
+            data = r.json()
+            if r.status_code == 200 and data.get("ok"):
+                return {"ok": True, "message": data.get("message", "Service restarted")}
+            else:
+                error_msg = data.get("message", "Unknown error") if data else "No response"
+                return {"ok": False, "message": f"Slave error: {error_msg}"}
     except Exception as e:
-        return {"ok": False, "message": f"Failed to restart: {str(e)[:50]}"}
-    
-    return {"ok": False, "message": "Slave not responding"}
+        return {"ok": False, "message": f"Failed to reach slave: {str(e)[:100]}"}
 
 
 @app.get("/api/slaves/{slave_id}/jobs")
@@ -1111,10 +1131,10 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool, master_
             print(f"[JOB {job_id}] Starting DNS filtering on {len(cleaned)} domains...")
             live, dead = await dns_filter_async(cleaned, job_id)
             print(f"[JOB {job_id}] DNS filtering complete: {len(live)} live, {dead} dead")
-            await db.update_job(job_id, domains_live=len(live), dns_stats={"alive": len(live), "dead": dead})
+            await db.update_job(job_id, domains_live=len(live), dns_stats={"alive": len(live), "dead": dead}, live_domains=live)
         else:
             print(f"[JOB {job_id}] Skipping DNS filter (dns_on={dns_on})")
-            await db.update_job(job_id, domains_live=len(live))
+            await db.update_job(job_id, domains_live=len(live), live_domains=live)
 
         if not live:
             print(f"[JOB {job_id}] No live domains, completing job")
@@ -1211,8 +1231,13 @@ async def _poll_until_done(job_id: str):
     while True:
         await asyncio.sleep(5)
         
-        # Check if job was cancelled
+        # Check if job was cancelled or paused
         if job_cancel_flags.get(job_id, False) or job.get("status") == "cancelled":
+            # Don't mark as cancelled if job is already paused
+            current_job = await db.get_job(job_id)
+            if current_job and current_job.get("status") == "paused":
+                print(f"[POLL] Job {job_id} is paused, stopping poll")
+                return
             await db.update_job(job_id, status="cancelled")
             return
         
@@ -1406,6 +1431,226 @@ async def cancel_job(job_id: str):
     await _notify_slaves_cancel(job_id)
     
     return {"ok": True, "status": "cancelled"}
+
+
+@app.post("/api/jobs/{job_id}/pause")
+async def pause_job(job_id: str):
+    """Pause a running job, save remaining domains, and notify all slaves to stop."""
+    global job_cancel_flags
+    
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    
+    if job["status"] not in ("pending", "running", "scraping", "processing", "cleaning", "dns_filtering"):
+        raise HTTPException(400, f"Cannot pause job with status: {job['status']}")
+    
+    # Set cancellation flag to stop slaves
+    job_cancel_flags[job_id] = True
+    
+    # Calculate remaining domains based on progress
+    progress = job.get("progress") or {}
+    domains_total = progress.get("domains_total", job.get("domains_total", 0))
+    domains_done = progress.get("domains_done", job.get("domains_done", 0))
+    remaining_count = max(0, domains_total - domains_done)
+    
+    # Get assignments to reconstruct remaining domains
+    assignments = await db.get_job_assignments(job_id)
+    remaining_domains = []
+    
+    if assignments:
+        # Use stored live_domains from the job (already DNS-filtered)
+        live = job.get("live_domains") or []
+        
+        if live:
+            # Get domains_per_slave from job to reconstruct chunks
+            domains_per_slave = job.get("domains_per_slave") or {}
+            slave_ids = list(domains_per_slave.keys())
+            
+            if slave_ids:
+                # Rebuild the original chunks
+                chunk_size = len(live) // len(slave_ids)
+                remainder = len(live) % len(slave_ids)
+                
+                chunks = {}
+                idx = 0
+                for i, sid in enumerate(slave_ids):
+                    size = chunk_size + (1 if i < remainder else 0)
+                    chunks[sid] = live[idx:idx+size]
+                    idx += size
+                
+                # Collect unfinished domains from each assignment
+                for a in assignments:
+                    sid = a["slave_id"]
+                    assigned = a.get("domains_assigned", 0) or 0
+                    done = a.get("domains_done", 0) or 0
+                    remaining = max(0, assigned - done)
+                    
+                    if remaining > 0 and sid in chunks:
+                        chunk = chunks[sid]
+                        # Take the unprocessed portion of the chunk
+                        unfinished_from_chunk = chunk[done:done+remaining]
+                        remaining_domains.extend(unfinished_from_chunk)
+        else:
+            print(f"[PAUSE] Warning: No live_domains stored in job, cannot determine remaining domains")
+    
+    # Update job to paused status with remaining domains
+    await db.update_job(
+        job_id,
+        status="paused",
+        error=None,
+        remaining_domains=remaining_domains if remaining_domains else None,
+    )
+    
+    # Update slave statuses back to idle
+    for a in assignments:
+        await db.update_slave(a["slave_id"], status="idle", domains_assigned=0, domains_done=0)
+    
+    # Log the pause
+    await db.log_activity(
+        "info", 
+        "jobs", 
+        f"Job {job_id} paused with {len(remaining_domains)} remaining domains", 
+        {"job_id": job_id, "remaining_count": len(remaining_domains)}
+    )
+    
+    # Notify all slaves to cancel this job
+    await _notify_slaves_cancel(job_id)
+    
+    return {
+        "ok": True, 
+        "status": "paused", 
+        "remaining_domains": len(remaining_domains)
+    }
+
+
+@app.post("/api/jobs/{job_id}/resume")
+async def resume_job(request: Request, job_id: str, workers: int = 12, turbo: bool = True):
+    """Resume a paused job with remaining domains."""
+    global job_cancel_flags
+    
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    
+    if job["status"] != "paused":
+        raise HTTPException(400, f"Cannot resume job with status: {job['status']}. Only paused jobs can be resumed.")
+    
+    # Clear any previous cancel flag to prevent immediate cancellation
+    if job_id in job_cancel_flags:
+        del job_cancel_flags[job_id]
+        print(f"[RESUME] Cleared cancel flag for job {job_id}")
+    
+    # Get remaining domains
+    remaining_domains = job.get("remaining_domains") or []
+    domains_done = job.get("domains_done", 0)
+    
+    if not remaining_domains:
+        # If no remaining_domains stored, reconstruct from file
+        file_path = job.get("file_path")
+        if file_path and Path(file_path).exists():
+            try:
+                print(f"[RESUME] Loading domains from file, skipping first {domains_done} already processed...")
+                raw_lines = Path(file_path).read_text(encoding="utf-8").splitlines()
+                cleaned, _ = clean_domains(raw_lines, phase2=True)
+                dns_stats = job.get("dns_stats") or {}
+                if dns_stats.get("alive") is not None:
+                    live, _ = await dns_filter_async(cleaned, job_id)
+                else:
+                    live = cleaned
+                
+                # Skip domains that were already processed
+                if domains_done > 0 and domains_done < len(live):
+                    remaining_domains = live[domains_done:]
+                    print(f"[RESUME] Resuming from domain {domains_done}, {len(remaining_domains)} remaining")
+                else:
+                    remaining_domains = live
+            except Exception as e:
+                raise HTTPException(400, f"Could not load domains from file: {e}")
+        else:
+            raise HTTPException(400, "No remaining domains stored and cannot load from file")
+    
+    if not remaining_domains:
+        raise HTTPException(400, "No remaining domains to process")
+    
+    print(f"[RESUME] Job {job_id}: {len(remaining_domains)} domains to resume")
+    
+    # Get currently active slaves
+    slaves_list = await db.list_slaves()
+    active = {s["id"]: s for s in slaves_list
+              if s.get("status") not in ("dead", "offline", "provisioning", "error")}
+    
+    if not active:
+        raise HTTPException(400, "No active slaves available — bring slaves online first")
+    
+    # Split remaining domains across active slaves
+    slave_ids = list(active.keys())
+    n = len(slave_ids)
+    chunk_size = len(remaining_domains) // n
+    remainder = len(remaining_domains) % n
+    
+    new_chunks = {}
+    new_domains_per_slave = {}
+    idx = 0
+    for i, sid in enumerate(slave_ids):
+        size = chunk_size + (1 if i < remainder else 0)
+        new_chunks[sid] = remaining_domains[idx:idx+size]
+        idx += size
+        new_domains_per_slave[sid] = len(new_chunks[sid])
+        
+        # Create/update assignment
+        await db.assign_job_to_slave(job_id, sid, len(new_chunks[sid]))
+        # Update slave status
+        await db.update_slave(sid, status="scraping", domains_assigned=len(new_chunks[sid]),
+                              domains_done=0, emails_found=0)
+    
+    # Update job status - clear remaining_domains since we're processing them now
+    await db.update_job(
+        job_id, 
+        status="scraping", 
+        domains_per_slave=new_domains_per_slave,
+        remaining_domains=None,
+        error=None
+    )
+    
+    await db.log_activity(
+        "info", 
+        "jobs", 
+        f"Job {job_id} resumed: {len(remaining_domains)} domains to {len(active)} slaves", 
+        {"job_id": job_id}
+    )
+    
+    # Dispatch to slaves
+    master_url = str(request.base_url).rstrip("/")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        tasks = []
+        for sid, chunk in new_chunks.items():
+            url = active[sid]["url"]
+            tasks.append(
+                client.post(f"{url}/api/scrape", json={
+                    "job_id": job_id,
+                    "master_url": master_url,
+                    "domains": chunk,
+                    "workers": workers,
+                    "turbo": turbo,
+                })
+            )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, r in enumerate(results):
+            sid = slave_ids[i]
+            if isinstance(r, Exception):
+                await db.update_slave(sid, status="error")
+                await db.update_job(job_id, error=f"Slave {sid}: {str(r)[:100]}")
+    
+    # Poll until done
+    asyncio.create_task(_poll_until_done(job_id))
+    
+    return {
+        "ok": True, 
+        "status": "scraping", 
+        "domains_resumed": len(remaining_domains), 
+        "slaves_used": len(active)
+    }
 
 
 @app.post("/api/jobs/{job_id}/retry")

@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     dns_stats JSONB,
     progress JSONB,
     domains_per_slave JSONB,
+    remaining_domains JSONB,
+    live_domains JSONB,
     error TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     started_at TIMESTAMP,
@@ -238,7 +240,7 @@ async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
         SELECT id, name, status, file_path, result_file,
                domains_total, domains_cleaned, domains_live, domains_done,
                emails_count, clean_stats, dns_stats, progress, domains_per_slave,
-               error, created_at, started_at, finished_at, updated_at
+               remaining_domains, live_domains, error, created_at, started_at, finished_at, updated_at
         FROM jobs WHERE id = :id
         """,
         {"id": job_id}
@@ -248,7 +250,7 @@ async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     
     job = dict(row)
     # Parse JSONB fields
-    for field in ["clean_stats", "dns_stats", "progress", "domains_per_slave"]:
+    for field in ["clean_stats", "dns_stats", "progress", "domains_per_slave", "remaining_domains", "live_domains"]:
         if job.get(field) and isinstance(job[field], str):
             try:
                 job[field] = json.loads(job[field])
@@ -258,7 +260,7 @@ async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def update_job(job_id: str, **fields):
-    """Update job fields."""
+    """Update job fields. Allows None values to clear JSONB fields."""
     if not fields:
         return
     
@@ -266,15 +268,18 @@ async def update_job(job_id: str, **fields):
     set_clauses = []
     values = {"id": job_id}
     
+    # Fields that can be updated (including live_domains)
+    allowed_fields = [
+        "name", "status", "file_path", "result_file",
+        "domains_total", "domains_cleaned", "domains_live", "domains_done",
+        "emails_count", "clean_stats", "dns_stats", "progress",
+        "domains_per_slave", "remaining_domains", "live_domains", "error", "started_at", "finished_at"
+    ]
+    
     for key, value in fields.items():
-        if value is not None and key in [
-            "name", "status", "file_path", "result_file",
-            "domains_total", "domains_cleaned", "domains_live", "domains_done",
-            "emails_count", "clean_stats", "dns_stats", "progress",
-            "domains_per_slave", "error", "started_at", "finished_at"
-        ]:
+        if key in allowed_fields:
             set_clauses.append(f"{key} = :{key}")
-            # Convert dicts to JSON strings for JSONB fields
+            # Convert dicts to JSON strings for JSONB fields, allow None to clear
             if isinstance(value, (dict, list)):
                 values[key] = json.dumps(value)
             else:
@@ -332,7 +337,7 @@ async def list_jobs(
     
     query = f"""
         SELECT id, name, status, domains_total, domains_cleaned, domains_live,
-               domains_done, emails_count, progress, error, created_at,
+               domains_done, emails_count, progress, remaining_domains, error, created_at,
                started_at, finished_at
         FROM jobs
         {where_sql}
@@ -349,6 +354,11 @@ async def list_jobs(
                 job["progress"] = json.loads(job["progress"])
             except:
                 job["progress"] = None
+        if job.get("remaining_domains") and isinstance(job["remaining_domains"], str):
+            try:
+                job["remaining_domains"] = json.loads(job["remaining_domains"])
+            except:
+                job["remaining_domains"] = None
         jobs.append(job)
     
     return {
@@ -731,6 +741,7 @@ async def get_system_stats() -> Dict[str, Any]:
             COUNT(*) FILTER (WHERE status = 'dns_filtering') as dns_filtering,
             COUNT(*) FILTER (WHERE status = 'scraping') as scraping,
             COUNT(*) FILTER (WHERE status = 'processing') as processing,
+            COUNT(*) FILTER (WHERE status = 'paused') as paused,
             COUNT(*) FILTER (WHERE status = 'completed') as completed,
             COUNT(*) FILTER (WHERE status = 'failed') as failed,
             COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled,

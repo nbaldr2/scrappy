@@ -711,11 +711,18 @@ _pause_flag = threading.Event()
 async def restart_service():
     """Restart the scraper-slave service (clears memory)."""
     import subprocess
+    import os
     try:
+        # Check if running as root
+        is_root = os.getuid() == 0
+        cmd = ["systemctl", "restart", "scraper-slave"] if is_root else ["sudo", "systemctl", "restart", "scraper-slave"]
+        
         # Schedule restart after returning response
         def do_restart():
             time.sleep(1)
-            subprocess.run(["systemctl", "restart", "scraper-slave"], check=False)
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"[RESTART] Failed: {result.stderr}")
         
         threading.Thread(target=do_restart, daemon=True).start()
         return {"ok": True, "message": "Service restart initiated"}
@@ -741,10 +748,14 @@ async def resume_jobs():
 
 @app.post("/api/system/reboot")
 async def reboot_vps():
-    """Reboot the VPS (requires sudo)."""
+    """Reboot the VPS."""
     import subprocess
+    import os
     try:
-        subprocess.run(["sudo", "reboot"], check=False)
+        # Check if running as root
+        is_root = os.getuid() == 0
+        cmd = ["reboot"] if is_root else ["sudo", "reboot"]
+        subprocess.run(cmd, check=False)
         return {"ok": True, "message": "Reboot initiated"}
     except Exception as e:
         return {"ok": False, "message": str(e)[:100]}

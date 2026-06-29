@@ -21,6 +21,7 @@ from urllib3.util.retry import Retry
 import urllib3
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 try:
@@ -33,6 +34,15 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI(title="Scraper Slave")
+
+# Allow cross-origin requests from master dashboard
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 SLAVE_ID = os.environ.get("SLAVE_ID", str(uuid.uuid4())[:8])
@@ -694,13 +704,38 @@ def _heartbeat_loop():
         }
 
         try:
-            httpx.post(
+            r = httpx.post(
                 f"{MASTER_URL}/api/slaves/{SLAVE_ID}/heartbeat",
                 json=payload,
                 timeout=8.0,
             )
-        except Exception:
-            pass  # Master unreachable — will retry next interval
+            if r.status_code == 404:
+                # Master doesn't know this slave ID — re-register
+                print(f"[HEARTBEAT] Slave {SLAVE_ID} unknown to master — re-registering...")
+                try:
+                    # Get our own IP for registration
+                    import socket
+                    hostname = socket.gethostname()
+                    try:
+                        local_ip = socket.gethostbyname(hostname)
+                    except Exception:
+                        local_ip = "0.0.0.0"
+                    port = int(os.environ.get("SLAVE_PORT", 8001))
+                    reg = httpx.post(
+                        f"{MASTER_URL}/api/slaves",
+                        json={"id": SLAVE_ID, "url": f"http://{local_ip}:{port}", "name": f"Slave-{SLAVE_ID}", "ip": local_ip},
+                        timeout=8.0,
+                    )
+                    if reg.status_code == 200:
+                        print(f"[HEARTBEAT] Re-registered slave {SLAVE_ID} successfully")
+                    else:
+                        print(f"[HEARTBEAT] Re-registration failed: {reg.status_code} {reg.text[:100]}")
+                except Exception as reg_err:
+                    print(f"[HEARTBEAT] Re-registration error: {reg_err}")
+            elif r.status_code != 200:
+                print(f"[HEARTBEAT] Heartbeat failed: HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[HEARTBEAT] Master unreachable: {type(e).__name__}")
 
 
 # ── System Control Endpoints ────────────────────────────────────────────────────
@@ -770,6 +805,55 @@ async def system_status():
         "paused": _pause_flag.is_set(),
         "active_jobs": len(active_jobs),
         "system_stats": _get_system_stats(),
+    }
+
+
+@app.post("/api/system/clear-memory")
+async def clear_memory():
+    """Clear memory by removing finished jobs and forcing garbage collection."""
+    import gc
+    
+    # Get memory stats before
+    stats_before = _get_system_stats()
+    ram_before = stats_before.get("ram_used_mb", 0)
+    
+    # Remove completed/cancelled/failed jobs from memory
+    jobs_to_remove = []
+    for job_id, job in active_jobs.items():
+        if job.get("status") in ("completed", "cancelled", "failed"):
+            jobs_to_remove.append(job_id)
+    
+    for job_id in jobs_to_remove:
+        del active_jobs[job_id]
+        # Also clear cancellation flag if exists
+        with job_cancel_lock:
+            if job_id in job_cancelled:
+                del job_cancelled[job_id]
+    
+    # Clear thread-local sessions to free connection pools
+    global _thread_local
+    if hasattr(_thread_local, "session"):
+        try:
+            _thread_local.session.close()
+        except:
+            pass
+        delattr(_thread_local, "session")
+    
+    # Force garbage collection
+    gc.collect()
+    
+    # Get memory stats after
+    stats_after = _get_system_stats()
+    ram_after = stats_after.get("ram_used_mb", 0)
+    ram_freed = max(0, ram_before - ram_after)
+    
+    return {
+        "ok": True,
+        "message": f"Memory cleared: {len(jobs_to_remove)} jobs removed, {ram_freed}MB freed",
+        "jobs_removed": len(jobs_to_remove),
+        "ram_before_mb": ram_before,
+        "ram_after_mb": ram_after,
+        "ram_freed_mb": ram_freed,
     }
 
 

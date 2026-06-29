@@ -481,7 +481,7 @@ async def list_slaves(status: str = None) -> List[Dict[str, Any]]:
         query += " WHERE status = :status"
         values["status"] = status
     
-    query += " ORDER BY updated_at DESC"
+    query += " ORDER BY name ASC"
     
     rows = await db.fetch_all(query, values)
     slaves = []

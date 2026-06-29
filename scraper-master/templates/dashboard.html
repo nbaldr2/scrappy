@@ -4,6 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Scraper Master — Dashboard</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/static/favicon-16x16.svg" sizes="16x16" type="image/svg+xml">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -33,6 +35,7 @@
       <button class="btn btn-ghost btn-sm" id="checkAllBtn" onclick="checkAllSlaves()">⚡ Check All</button>
       <button class="btn btn-secondary btn-sm" onclick="toggleAllSlaves()">🔄 Toggle All</button>
       <button class="btn btn-warning btn-sm" onclick="restartAllServices()">🔄 Restart All</button>
+      <button class="btn btn-warning btn-sm" onclick="clearAllSlavesMemory()" style="background:#f59e0b;color:#fff">🧹 Clear All Memory</button>
       <button class="btn btn-secondary btn-sm" onclick="pauseAllSlaves()">⏸️ Pause All</button>
       <button class="btn btn-success btn-sm" onclick="resumeAllSlaves()">▶️ Resume All</button>
       <button class="btn btn-primary btn-sm" onclick="openProvisionModal()">+ Add Slave VPS</button>
@@ -172,6 +175,7 @@
     <h4 style="margin:16px 0 8px;font-size:0.95rem">⚡ Control Actions</h4>
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">
       <button class="btn btn-ghost btn-sm" id="slaveBtnRestartService" onclick="restartSlaveService()">🔄 Restart Service</button>
+      <button class="btn btn-ghost btn-sm" onclick="clearSlaveMemory()">🧹 Clear Memory</button>
       <button class="btn btn-ghost btn-sm" id="slaveBtnPause" onclick="pauseSlave()">⏸️ Pause</button>
       <button class="btn btn-ghost btn-sm" id="slaveBtnResume" onclick="resumeSlave()" style="display:none">▶️ Resume</button>
       <button class="btn btn-danger btn-sm" onclick="rebootSlave()">🔴 Reboot VPS</button>
@@ -228,8 +232,9 @@ async function loadLogsFromDB(){
   }catch(e){console.error('Failed to load logs',e);}
 }
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
-function formatTime(iso){if(!iso)return'—';try{return new Date(iso).toLocaleTimeString()}catch{return iso}}
+function formatTime(iso){if(!iso)return'—';try{return new Date(iso).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}catch{return iso}}
 function timeSince(iso){if(!iso)return'—';try{const s=Math.floor((Date.now()-new Date(iso).getTime())/1000);if(s<10)return'just now';if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago'}catch{return'—'}}
+function formatLastSeen(iso){if(!iso)return'—';try{const d=new Date(iso);const t=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});const s=Math.floor((Date.now()-d.getTime())/1000);if(s<10)return t+' (just now)';if(s<60)return t+' ('+s+'s ago)';if(s<3600)return t+' ('+Math.floor(s/60)+'m ago)';return t+' ('+Math.floor(s/3600)+'h ago)'}catch{return'—'}}
 
 // ── Provision Modal ──
 function openProvisionModal(){document.getElementById('provisionModal').classList.add('active');document.getElementById('provisionLog').style.display='none'}
@@ -291,7 +296,7 @@ function openSlaveSettings(id) {
     document.getElementById('slaveSettingsName').value = s.name || '';
     document.getElementById('slaveSettingsStatus').value = s.status || '';
     document.getElementById('slaveSettingsIP').value = s.ip || '';
-    document.getElementById('slaveSettingsLastSeen').value = timeSince(s.last_seen);
+    document.getElementById('slaveSettingsLastSeen').value = formatLastSeen(s.last_seen);
     
     // Show enabled status
     const enabled = s.enabled !== false;
@@ -382,6 +387,25 @@ async function resumeSlave() {
   }
 }
 
+async function clearSlaveMemory() {
+  if (!currentSlaveId) return;
+  if (!confirm('Clear memory on this slave? This removes finished jobs from RAM.')) return;
+  try {
+    const slave = allSlaves.find(s => s.id === currentSlaveId);
+    if (!slave) return;
+    const r = await fetch(`${slave.url}/api/system/clear-memory`, { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      toast(`${d.message}`, 'success');
+      addLog(`Slave ${currentSlaveId} memory cleared: ${d.ram_freed_mb}MB freed`, 'log-success');
+    } else {
+      toast(d.message || 'Failed to clear memory', 'error');
+    }
+  } catch (e) {
+    toast('Failed to clear memory', 'error');
+  }
+}
+
 async function rebootSlave() {
   if (!currentSlaveId) return;
   if (!confirm('Reboot the slave VPS? This will take the slave offline temporarily.')) return;
@@ -436,7 +460,7 @@ async function refreshSlaves(){
         <td style="font-family:var(--font-mono);font-size:0.82rem">${disk}</td>
         <td>${s.domains_assigned}</td><td>${s.domains_done}</td>
         <td style="color:var(--success);font-weight:600">${s.emails_found}</td>
-        <td style="font-size:0.75rem;color:var(--text-muted)">${timeSince(s.last_seen)}</td>
+        <td style="font-size:0.75rem;color:var(--text-muted)">${formatLastSeen(s.last_seen)}</td>
         <td>${toggleBtn} <button class="btn btn-ghost btn-sm" onclick="openSlaveSettings('${s.id}')" title="Settings">⚙️</button> <button class="btn btn-danger btn-sm" onclick="removeSlave('${s.id}')" title="Remove">✕</button></td>
       </tr>`}).join('');
   }catch{}
@@ -732,6 +756,45 @@ async function resumeAllSlaves() {
     refreshSlaves();
   } catch (e) {
     toast('Failed to resume slaves', 'error');
+  }
+}
+
+// ── Clear All Slaves Memory ──
+async function clearAllSlavesMemory() {
+  if (!confirm('Clear memory on ALL slaves? This removes finished jobs from RAM.')) return;
+  
+  try {
+    const r = await fetch('/api/slaves');
+    const slaves = await r.json();
+    const enabledSlaves = slaves.filter(s => s.enabled !== false);
+    
+    if (enabledSlaves.length === 0) {
+      toast('No slaves to clear memory', 'info');
+      return;
+    }
+    
+    toast(`Clearing memory on ${enabledSlaves.length} slaves...`, 'warning');
+    
+    let success = 0, failed = 0, totalFreed = 0;
+    for (const s of enabledSlaves) {
+      try {
+        const r2 = await fetch(`${s.url}/api/system/clear-memory`, { method: 'POST', timeout: 10000 });
+        const d2 = await r2.json();
+        if (d2.ok) {
+          success++;
+          totalFreed += d2.ram_freed_mb || 0;
+        } else {
+          failed++;
+        }
+      } catch (e) {
+        failed++;
+      }
+    }
+    
+    toast(`${success} cleared, ${failed} failed. ${totalFreed}MB freed total`, failed > 0 ? 'warning' : 'success');
+    addLog(`Clear all memory: ${success} success, ${failed} failed, ${totalFreed}MB freed`, failed > 0 ? 'log-warning' : 'log-success');
+  } catch (e) {
+    toast('Failed to clear memory', 'error');
   }
 }
 

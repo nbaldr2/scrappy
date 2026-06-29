@@ -24,6 +24,7 @@ import httpx
 import paramiko
 from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+import json as _json
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -54,12 +55,16 @@ slaves: dict[str, dict] = {}
 # ── Main event loop reference (for thread-safe database access) ────────────────
 _main_loop: asyncio.AbstractEventLoop = None
 
+# ── Background task references ─────────────────────────────────────────────────
+_monitor_task: asyncio.Task = None
+_progress_task: asyncio.Task = None
+
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - startup and shutdown events."""
-    global _monitor_task
+    global _monitor_task, _progress_task
     # Startup
     print("Initializing database...")
     await db.init_database()
@@ -75,6 +80,9 @@ async def lifespan(app: FastAPI):
     # Start heartbeat monitor
     _monitor_task = asyncio.create_task(_heartbeat_monitor())
     print("Heartbeat monitor started")
+    # Start progress poller for jobs that survive restarts
+    _progress_task = asyncio.create_task(_progress_poller())
+    print("Progress poller started")
     yield
     # Shutdown
     print("Stopping heartbeat monitor...")
@@ -84,10 +92,43 @@ async def lifespan(app: FastAPI):
             await _monitor_task
         except asyncio.CancelledError:
             pass
+    print("Stopping progress poller...")
+    if _progress_task:
+        _progress_task.cancel()
+        try:
+            await _progress_task
+        except asyncio.CancelledError:
+            pass
     print("Closing database connection...")
     await db.close_database()
 
 app = FastAPI(title="Scraper Master", version="2.1.0", lifespan=lifespan)
+
+# Middleware: add 'Z' suffix to naive UTC datetime strings in JSON responses
+# so the browser interprets them as UTC instead of local time
+import re as _re
+from starlette.responses import Response as _Response
+_DT_PATTERN = _re.compile(rb'"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?)(?<!Z)"')
+
+@app.middleware("http")
+async def _utc_datetime_middleware(request, call_next):
+    response = await call_next(request)
+    ct = response.headers.get("content-type", "")
+    if "application/json" in ct:
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
+        body = _DT_PATTERN.sub(rb'"\1Z"', body)
+        headers = dict(response.headers)
+        if "content-length" in headers:
+            del headers["content-length"]
+        return _Response(
+            content=body,
+            status_code=response.status_code,
+            headers=headers,
+            media_type="application/json",
+        )
+    return response
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
@@ -493,16 +534,66 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
             # Remove any broken venv first
             _exec(ssh, f"rm -rf {REMOTE_DIR}/venv", timeout=10)
             
-            # Create venv — this should work now since we ensured python3-venv above
-            log("Creating Python venv...")
-            _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv", timeout=60)
+            # Python 3.14+ doesn't have pre-built wheels for many packages yet
+            # Install Python 3.12 from deadsnakes PPA if running 3.14+
+            py_major, py_minor = map(int, py_ver_full.split('.'))
+            py312_available = False
+            if py_major >= 3 and py_minor >= 14:
+                log("⚠ Python 3.14+ detected — installing Python 3.12 for compatibility...")
+                # Try deadsnakes PPA first
+                try:
+                    _exec(ssh, "apt-get install -y software-properties-common -qq 2>/dev/null", timeout=60)
+                    _exec(ssh, "add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null", timeout=60)
+                    _exec(ssh, "apt-get update -qq 2>/dev/null", timeout=60)
+                    _exec(ssh, "apt-get install -y python3.12 python3.12-venv python3.12-dev -qq", timeout=120)
+                    py312_available = True
+                except Exception:
+                    log("⚠ deadsnakes PPA failed — building Python 3.12 from source...")
+                
+                # Verify 3.12 actually works
+                if py312_available:
+                    py312_check = _exec(ssh, "python3.12 -c 'import sys; print(sys.version)' 2>/dev/null || echo FAIL", timeout=10).strip()
+                    if "3.12" not in py312_check:
+                        py312_available = False
+                        log("⚠ python3.12 binary not working")
+                
+                # Fallback: build Python 3.12 from source
+                if not py312_available:
+                    log("Building Python 3.12 from source (2-3 min)...")
+                    try:
+                        _exec(ssh, "apt-get install -y build-essential zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev wget -qq 2>/dev/null || true", timeout=120)
+                        _exec(ssh, "cd /tmp && wget -q https://www.python.org/ftp/python/3.12.8/Python-3.12.8.tgz && tar xzf Python-3.12.8.tgz", timeout=120)
+                        _exec(ssh, "cd /tmp/Python-3.12.8 && ./configure --enable-optimizations --prefix=/opt/python3.12 -q 2>/dev/null && make -s -j$(nproc) && make altinstall 2>/dev/null", timeout=600)
+                        py312_check2 = _exec(ssh, "/opt/python3.12/bin/python3.12 -c 'import sys; print(sys.version)' 2>/dev/null || echo FAIL", timeout=10).strip()
+                        if "3.12" in py312_check2:
+                            # Create symlink so python3.12 is on PATH
+                            _exec(ssh, "ln -sf /opt/python3.12/bin/python3.12 /usr/local/bin/python3.12", timeout=10)
+                            py312_available = True
+                            log(f"✓ Python 3.12 built from source: {py312_check2}")
+                        else:
+                            log("⚠ Python 3.12 build failed")
+                    except Exception as e:
+                        log(f"⚠ Python 3.12 source build failed: {str(e)[:80]}")
+                
+                if py312_available:
+                    log("✓ Using Python 3.12 for venv")
+                    _exec(ssh, f"cd {REMOTE_DIR} && python3.12 -m venv venv", timeout=60)
+                else:
+                    log("⚠ Python 3.12 unavailable — falling back to system python3 (3.14)")
+                    _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv", timeout=60)
+            else:
+                # Create venv with system python
+                log("Creating Python venv...")
+                _exec(ssh, f"cd {REMOTE_DIR} && python3 -m venv venv", timeout=60)
             
             # CRITICAL: Verify pip exists in the venv (python3-venv missing causes venv without pip)
             pip_check = _exec(ssh, f"test -f {REMOTE_DIR}/venv/bin/pip && echo OK || echo FAIL", timeout=10).strip()
             if pip_check != "OK":
                 log("⚠ pip missing from venv — installing via get-pip.py...")
                 # Use --without-pip to create a clean venv, then bootstrap pip
-                _exec(ssh, f"rm -rf {REMOTE_DIR}/venv && cd {REMOTE_DIR} && python3 -m venv venv --without-pip", timeout=60)
+                # Use python3.12 if it was installed, otherwise fall back to python3
+                py_cmd = "python3.12" if py_major >= 3 and py_minor >= 14 else "python3"
+                _exec(ssh, f"rm -rf {REMOTE_DIR}/venv && cd {REMOTE_DIR} && {py_cmd} -m venv venv --without-pip", timeout=60)
                 _exec(ssh, f"cd {REMOTE_DIR} && curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py && {REMOTE_DIR}/venv/bin/python get-pip.py && rm -f get-pip.py", timeout=120)
                 
                 # Re-verify pip exists
@@ -510,15 +601,57 @@ def _provision_slave_ssh(sid: str, ip: str, user: str, password: str,
                 if pip_check2 != "OK":
                     raise RuntimeError("Failed to create venv with pip — python3-venv may be broken on this VPS")
             
+            # Install system dependencies for lxml (needed on some VPS)
+            log("Installing system dependencies...")
+            _exec(ssh, "apt-get update -qq && apt-get install -y -qq libxml2-dev libxslt1-dev gcc 2>/dev/null || true", timeout=120)
+            
             log("Installing Python packages (may take 30-90s)...")
             _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --upgrade pip -q", timeout=120)
-            _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --no-cache-dir -r requirements.txt -q", timeout=300)
             
-            # Verify packages actually work
-            verify = _exec(ssh, f"{REMOTE_DIR}/venv/bin/python -c 'import fastapi,uvicorn,httpx,requests,lxml,cssselect,colorama,pydantic' 2>&1 && echo VERIFIED", timeout=15).strip()
-            if not verify.endswith("VERIFIED"):
-                raise RuntimeError("Package import verification failed after installation")
-            log("✓ Python dependencies installed and verified")
+            # Install packages with longer timeout for Python 3.14+ (may need compilation)
+            py_major, py_minor = map(int, py_ver_full.split('.'))
+            install_timeout = 600 if py_major >= 3 and py_minor >= 14 else 300
+            
+            # First try: install all packages from requirements.txt
+            log("Running pip install...")
+            pip_ok = False
+            try:
+                _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --no-cache-dir -r requirements.txt -q 2>&1 && echo PIP_OK", timeout=install_timeout)
+                pip_ok = True
+            except Exception as e:
+                log(f"⚠ Full install failed: {str(e)[:80]}")
+            
+            # Fallback: install core packages only (skip lxml/cssselect if they failed)
+            if not pip_ok:
+                log("Retrying with core packages only (lxml/cssselect optional)...")
+                try:
+                    _exec(ssh, f"cd {REMOTE_DIR} && venv/bin/pip install --no-cache-dir fastapi uvicorn httpx requests colorama pydantic beautifulsoup4 -q", timeout=300)
+                    pip_ok = True
+                except Exception as e:
+                    log(f"⚠ Core install also failed: {str(e)[:80]}")
+                    raise RuntimeError(f"Failed to install Python packages: {str(e)[:100]}")
+            
+            # Verify critical packages work (lxml/cssselect are optional with fallbacks)
+            log("Verifying installation...")
+            # Test each package individually (bulk import can fail on Python 3.14+)
+            all_ok = True
+            for pkg in ["fastapi", "uvicorn", "httpx", "requests", "colorama", "pydantic"]:
+                try:
+                    _exec(ssh, f"{REMOTE_DIR}/venv/bin/python -c 'import {pkg}' 2>&1", timeout=5)
+                    log(f"  ✓ {pkg} OK")
+                except Exception as e:
+                    log(f"  ✗ {pkg} FAILED: {str(e)[:50]}")
+                    all_ok = False
+            
+            if not all_ok:
+                raise RuntimeError("Package import verification failed — some core packages missing")
+            
+            # Check optional packages (lxml/cssselect) - warn but don't fail
+            try:
+                _exec(ssh, f"{REMOTE_DIR}/venv/bin/python -c 'import lxml,cssselect' 2>/dev/null && echo OK", timeout=10).strip()
+                log("✓ Python dependencies installed and verified (including lxml/cssselect)")
+            except:
+                log("⚠ Core packages OK (lxml/cssselect optional - using BeautifulSoup fallback)")
 
         # 5. Create systemd service
         log("Configuring systemd service...")
@@ -577,7 +710,7 @@ WantedBy=multi-user.target
         # 8. Mark as ready in memory
         slaves[sid]["status"] = "idle"
         slaves[sid]["provision_progress"] = "done"
-        slaves[sid]["last_seen"] = datetime.now().isoformat()
+        slaves[sid]["last_seen"] = datetime.utcnow()
         log("✅ Provisioning complete!")
         
         # 9. Update slave status in database via main event loop
@@ -653,87 +786,90 @@ async def _heartbeat_monitor():
             for s in db_slaves:
                 sid = s["id"]
                 if sid not in slaves:
-                    # New slave from DB - add to memory
+                    # New slave from DB - add to memory, parse last_seen to datetime
+                    s["last_seen"] = _parse_last_seen(s.get("last_seen"))
                     slaves[sid] = s
                 elif slaves[sid].get("status") == "provisioning":
                     # Sync provisioning progress from thread
                     slaves[sid]["provision_progress"] = s.get("provision_progress", "")
+                # Don't overwrite in-memory last_seen with DB string —
+                # in-memory datetime is always more recent
         except Exception as e:
             print(f"[HEARTBEAT] Failed to load slaves from DB: {e}")
         
         if not slaves:
             continue
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            for sid, s in list(slaves.items()):
-                # Check health status for all slaves (even disabled ones)
-                # Only skip provisioning slaves
-                if s.get("status") == "provisioning":
-                    continue  # Don't ping during provisioning
+        # Ping all slaves in parallel (not sequentially)
+        async def _check_slave(sid, s):
+            """Check one slave's health and update status."""
+            if s.get("status") == "provisioning":
+                return  # Don't ping during provisioning
+            
+            slave_url = s.get("url", "")
+            if not slave_url:
+                return
                 
-                slave_url = s.get("url", "")
-                if not slave_url:
-                    continue
-                    
-                try:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
                     r = await client.get(f"{slave_url}/api/health")
                     data = r.json()
-                    now_dt = datetime.now()
-                    system_stats = data.get("system_stats", {})
-                    
-                    # Update in-memory (keep datetime object, not string)
-                    slaves[sid]["last_seen"] = now_dt
-                    slaves[sid]["system_stats"] = system_stats
-                    # NOTE: Do NOT sync status from /api/health — it has no "status" field!
-                    # Status is properly updated via slave's /api/slaves/{id}/heartbeat endpoint.
-                    
-                    # Update database - only last_seen and system_stats
-                    update_data = {
-                        "last_seen": now_dt,
-                        "system_stats": system_stats,
-                    }
-                    
-                    # If marked offline/error/rebooting but responding now, revive to "idle"
-                    current_status = slaves[sid].get("status")
-                    if current_status in ("offline", "error", "rebooting"):
-                        slaves[sid]["status"] = "idle"
-                        update_data["status"] = "idle"
-                        if current_status == "rebooting":
-                            print(f"[HEARTBEAT] Slave {sid} back online after reboot")
-                    
-                    try:
-                        await db.update_slave(sid, **update_data)
-                    except Exception as e:
-                        print(f"[HEARTBEAT] Failed to update slave {sid} in DB: {e}")
-
+                now_dt = datetime.utcnow()
+                system_stats = data.get("system_stats", {})
+                
+                # Update in-memory (keep datetime object, not string)
+                slaves[sid]["last_seen"] = now_dt
+                slaves[sid]["system_stats"] = system_stats
+                
+                # Update database - only last_seen and system_stats
+                update_data = {
+                    "last_seen": now_dt,
+                    "system_stats": system_stats,
+                }
+                
+                # If marked offline/error/rebooting but responding now, revive to "idle"
+                current_status = slaves[sid].get("status")
+                if current_status in ("offline", "error", "rebooting"):
+                    slaves[sid]["status"] = "idle"
+                    update_data["status"] = "idle"
+                    if current_status == "rebooting":
+                        print(f"[HEARTBEAT] Slave {sid} back online after reboot")
+                
+                try:
+                    await db.update_slave(sid, **update_data)
                 except Exception as e:
-                    # Calculate time since last seen
-                    last = _parse_last_seen(s.get("last_seen"))
-                    if last is None:
-                        elapsed = HEARTBEAT_TIMEOUT + 1  # Force offline if never seen
-                    else:
-                        elapsed = (datetime.now() - last).total_seconds()
+                    print(f"[HEARTBEAT] Failed to update slave {sid} in DB: {e}")
 
-                    # Give rebooting slaves more time (2x timeout) to come back
-                    is_rebooting = s.get("status") == "rebooting"
-                    timeout_threshold = HEARTBEAT_TIMEOUT * 2 if is_rebooting else HEARTBEAT_TIMEOUT
+            except Exception:
+                # Calculate time since last seen
+                last = _parse_last_seen(s.get("last_seen"))
+                if last is None:
+                    elapsed = HEARTBEAT_TIMEOUT + 1  # Force offline if never seen
+                else:
+                    elapsed = (datetime.utcnow() - last).total_seconds()
 
-                    if elapsed > timeout_threshold:
-                        if s.get("status") not in ("offline", "rebooting"):
-                            print(f"[HEARTBEAT] Slave {sid} marked offline (no response for {int(elapsed)}s)")
-                            slaves[sid]["status"] = "offline"
-                            try:
-                                await db.update_slave(sid, status="offline")
-                            except Exception:
-                                pass
-                        elif is_rebooting and elapsed > HEARTBEAT_TIMEOUT * 3:
-                            # If rebooting for too long (6 min), mark as offline
-                            print(f"[HEARTBEAT] Slave {sid} reboot took too long, marking offline")
-                            slaves[sid]["status"] = "offline"
-                            try:
-                                await db.update_slave(sid, status="offline")
-                            except Exception:
-                                pass
+                # Give rebooting slaves more time (2x timeout) to come back
+                is_rebooting = s.get("status") == "rebooting"
+                timeout_threshold = HEARTBEAT_TIMEOUT * 2 if is_rebooting else HEARTBEAT_TIMEOUT
+
+                if elapsed > timeout_threshold:
+                    if s.get("status") not in ("offline", "rebooting"):
+                        print(f"[HEARTBEAT] Slave {sid} marked offline (no response for {int(elapsed)}s)")
+                        slaves[sid]["status"] = "offline"
+                        try:
+                            await db.update_slave(sid, status="offline")
+                        except Exception:
+                            pass
+                    elif is_rebooting and elapsed > HEARTBEAT_TIMEOUT * 3:
+                        print(f"[HEARTBEAT] Slave {sid} reboot took too long, marking offline")
+                        slaves[sid]["status"] = "offline"
+                        try:
+                            await db.update_slave(sid, status="offline")
+                        except Exception:
+                            pass
+
+        # Run all checks in parallel
+        await asyncio.gather(*[_check_slave(sid, s) for sid, s in list(slaves.items())])
 
 
 # ── Slave Management ───────────────────────────────────────────────────────────
@@ -780,7 +916,7 @@ async def provision_slave(data: dict, request: Request):
         "name": name,
         "ip": ip,
         "status": "provisioning",
-        "last_seen": datetime.now().isoformat(),
+        "last_seen": datetime.utcnow(),
         "domains_assigned": 0,
         "domains_done": 0,
         "emails_found": 0,
@@ -833,18 +969,22 @@ async def check_all_slaves():
 
     async def _ping(s: dict):
         sid = s["id"]
+        slave_url = s.get("url", "")
         try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(f"{s['url']}/api/health", timeout=10.0)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(f"{slave_url}/api/health")
                 if r.status_code == 200:
                     data = r.json()
-                    await db.update_slave(sid, status="online", system_stats=data.get("system", {}), last_seen=datetime.utcnow().isoformat())
+                    await db.update_slave(sid, status="idle", system_stats=data.get("system_stats", {}), last_seen=datetime.utcnow())
                     if sid in slaves:
-                        slaves[sid].update({"status": "online", "stats": data.get("system", {})})
+                        slaves[sid].update({"status": "idle", "system_stats": data.get("system_stats", {})})
                     results["online"] += 1
+                    print(f"[CHECK] Slave {sid} ({slave_url}) -> idle")
                     return
-        except Exception:
-            pass
+                else:
+                    print(f"[CHECK] Slave {sid} ({slave_url}) -> HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[CHECK] Slave {sid} ({slave_url}) -> Error: {type(e).__name__}: {e}")
         
         # Mark as offline
         await db.update_slave(sid, status="offline")
@@ -1003,7 +1143,7 @@ async def slave_heartbeat(slave_id: str, data: dict):
     if not slave:
         raise HTTPException(404, "Unknown slave")
     
-    now_dt = datetime.now()
+    now_dt = datetime.utcnow()
     
     # Update slave status
     update_fields = {
@@ -1219,6 +1359,102 @@ async def _run_job(job_id: str, workers: int, turbo: bool, dns_on: bool, master_
         await db.log_activity("error", "jobs", f"Job {job_id} failed: {str(e)[:100]}", {"job_id": job_id})
 
 
+# ── Background progress poller (survives master restarts) ─────────────────────
+
+async def _progress_poller():
+    """Background task: periodically updates progress for all scraping jobs.
+    This allows the dashboard to keep updating even after a master restart
+    when the in-memory _poll_until_done loop was lost."""
+    while True:
+        await asyncio.sleep(10)
+        try:
+            jobs_result = await db.list_jobs(status="scraping")
+            for job in jobs_result.get("jobs", []):
+                job_id = job["id"]
+                assignments = await db.get_job_assignments(job_id)
+                if not assignments:
+                    continue
+                
+                # Query each slave's status to get current domains_done
+                domains_per_slave = job.get("domains_per_slave") or {}
+                total_domains = sum(domains_per_slave.values()) if isinstance(domains_per_slave, dict) else 0
+                total_done = 0
+                any_scraping = False
+                all_done = True
+                
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    for a in assignments:
+                        sid = a["slave_id"]
+                        slave_url = a.get("slave_url", "")
+                        if not slave_url:
+                            continue
+                        try:
+                            r = await client.get(f"{slave_url}/api/status/{job_id}", timeout=8.0)
+                            data = r.json()
+                            sd = data.get("domains_done", 0) or 0
+                            total_done += sd
+                            sstatus = data.get("status", "unknown")
+                            if sstatus == "scraping":
+                                any_scraping = True
+                            if sstatus not in ("completed", "failed", "cancelled"):
+                                all_done = False
+                            # Update assignment in database
+                            await db.update_assignment(job_id, sid,
+                                domains_done=sd,
+                                emails_found=data.get("emails_found", 0) or 0,
+                                status=sstatus
+                            )
+                            # Save any new emails from status endpoint
+                            if data.get("emails"):
+                                await db.save_emails(job_id, data["emails"])
+                        except Exception:
+                            all_done = False
+                
+                # Get email count
+                email_count = await db.db.fetch_one(
+                    "SELECT COUNT(*) FROM emails WHERE job_id = :job_id",
+                    {"job_id": job_id}
+                )
+                email_count = email_count[0] if email_count else 0
+                
+                # Calculate and save progress
+                from datetime import datetime as dt2
+                if total_domains > 0 and total_done > 0:
+                    started = job.get("started_at") or job.get("created_at")
+                    elapsed = 0
+                    if started:
+                        if isinstance(started, str):
+                            sd2 = dt2.fromisoformat(started.replace("Z", "+00:00"))
+                        else:
+                            sd2 = started
+                        elapsed = (dt2.now() - sd2).total_seconds()
+                    percent = min(100, (total_done / total_domains) * 100)
+                    rate = total_done / elapsed if elapsed > 0 else 0
+                    remaining = total_domains - total_done
+                    estimated = remaining / rate if rate > 0 else 0
+                    progress = {
+                        "percent": round(percent, 1),
+                        "elapsed_seconds": round(elapsed),
+                        "estimated_seconds": round(estimated),
+                        "rate": round(rate, 1),
+                        "domains_done": total_done,
+                        "domains_total": total_domains,
+                        "emails_found": email_count or 0,
+                    }
+                    await db.update_job(job_id, domains_done=total_done, progress=progress)
+                
+                # Mark completed if all slaves done and no scraping
+                if all_done and not any_scraping and total_domains > 0:
+                    await db.update_job(job_id, status="completed", finished_at=dt2.now())
+                    # Save final emails to file
+                    all_emails = await db.get_emails(job_id)
+                    (RESULT_DIR / job_id).mkdir(parents=True, exist_ok=True)
+                    (RESULT_DIR / job_id / "emails.txt").write_text("\n".join(sorted(all_emails)), encoding="utf-8")
+                    print(f"[PROGRESS] Job {job_id} completed")
+        except Exception as e:
+            print(f"[PROGRESS] Error: {e}")
+
+
 async def _poll_until_done(job_id: str):
     """Poll slave progress until all done with progress tracking."""
     global job_cancel_flags
@@ -1279,7 +1515,7 @@ async def _poll_until_done(job_id: str):
                         status=data.get("status", "unknown"),
                         domains_done=data.get("domains_done", 0),
                         emails_found=data.get("emails_found", 0),
-                        last_seen=datetime.now(),
+                        last_seen=datetime.utcnow(),
                     )
                     
                     # Update assignment
@@ -1363,18 +1599,60 @@ async def collect_emails(job_id: str, data: dict):
         await db.save_emails(job_id, new_emails)
     
     # Update slave stats
+    slave_domains_done = data.get("domains_done", 0)
     if slave_id:
         await db.update_slave(slave_id,
             emails_found=data.get("total_emails", len(new_emails)),
-            domains_done=data.get("domains_done", 0)
+            domains_done=slave_domains_done
+        )
+        # Also update the assignment so progress recalculation works
+        await db.update_assignment(job_id, slave_id,
+            domains_done=slave_domains_done,
+            emails_found=data.get("total_emails", len(new_emails))
         )
     
-    # Get total count
+    # Get total email count
     count_result = await db.db.fetch_one(
         "SELECT COUNT(*) FROM emails WHERE job_id = :job_id",
         {"job_id": job_id}
     )
     total = count_result[0] if count_result else 0
+    
+    # Recalculate job progress from database (handles master restart without poll loop)
+    try:
+        assignments = await db.get_job_assignments(job_id)
+        total_done = sum(a.get("domains_done", 0) or 0 for a in assignments)
+        domains_per_slave = job.get("domains_per_slave") or {}
+        total_domains = sum(domains_per_slave.values()) if isinstance(domains_per_slave, dict) else 0
+        
+        if total_domains > 0:
+            from datetime import timedelta
+            import json
+            started = job.get("started_at") or job.get("created_at")
+            elapsed = 0
+            if started:
+                if isinstance(started, str):
+                    started_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                else:
+                    started_dt = started
+                elapsed = (datetime.now() - started_dt).total_seconds()
+            
+            percent = min(100, (total_done / total_domains) * 100)
+            rate = total_done / elapsed if elapsed > 0 else 0
+            remaining = total_domains - total_done
+            estimated = remaining / rate if rate > 0 else 0
+            progress = {
+                "percent": round(percent, 1),
+                "elapsed_seconds": round(elapsed),
+                "estimated_seconds": round(estimated),
+                "rate": round(rate, 1),
+                "domains_done": total_done,
+                "domains_total": total_domains,
+                "emails_found": total,
+            }
+            await db.update_job(job_id, domains_done=total_done, progress=progress)
+    except Exception:
+        pass
     
     return {"ok": True, "total": total}
 
